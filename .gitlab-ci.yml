@@ -2,6 +2,10 @@
 # Host-neutral alternative to .github/workflows/ — use whichever matches
 # your repository host.
 
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
 stages:
   - lint
   - test
@@ -12,6 +16,13 @@ variables:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUST_STABLE: "1.95.0"
+  SECRET_DETECTION_ENABLED: "true"
+
+sast:
+  stage: audit
+
+secret_detection:
+  stage: audit
 
 default:
   image: rust:${RUST_STABLE}
