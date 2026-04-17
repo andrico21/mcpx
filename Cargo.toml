@@ -1,0 +1,161 @@
+[package]
+name = "mcpx"
+version = "0.9.30"
+edition = "2024"
+rust-version = "1.95.0"
+license = "MIT OR Apache-2.0"
+description = "Reusable MCP server framework with auth, RBAC, and Streamable HTTP transport"
+readme = "README.md"
+repository = "https://github.com/andrico21/mcp-mcpx"
+homepage = "https://github.com/andrico21/mcp-mcpx"
+documentation = "https://docs.rs/mcpx"
+keywords = ["mcp", "model-context-protocol", "server", "oauth", "rbac"]
+categories = ["network-programming", "web-programming::http-server", "authentication"]
+authors = ["mcpx contributors"]
+exclude = [
+    "target/",
+    "flycheck0/",
+    "tmp/",
+    "tests/artifacts/",
+    ".github/",
+    ".gitlab-ci.yml",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# MCP Protocol - official Rust SDK
+rmcp = { version = "1.5", features = [
+  "server",
+  "transport-streamable-http-server",
+  "transport-io",
+  "macros",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["net", "signal", "macros", "rt"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# HTTP server
+axum = { version = "0.8" }
+tower = { version = "0.5", features = ["util", "timeout", "limit", "load-shed"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "timeout", "set-header", "compression-gzip", "compression-br"] }
+http-body-util = "0.1"
+
+# TLS
+rustls = { version = "0.23", default-features = false, features = [
+  "ring", "logging", "tls12",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+x509-parser = "0.18"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter", "json", "fmt",
+] }
+
+# Security
+argon2 = "0.5"
+subtle = "2"
+governor = "0.10"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rand = "0.10"
+
+# Lock-free pointer swap for hot-reload
+arc-swap = "1"
+
+# Utilities
+humantime = "2"
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Metrics (optional)
+prometheus = { version = "0.14", optional = true }
+
+# OAuth 2.1 JWT (optional)
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"], optional = true }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider", "json"], optional = true }
+urlencoding = { version = "2", optional = true }
+
+[features]
+default = []
+oauth = ["dep:jsonwebtoken", "dep:reqwest", "dep:urlencoding"]
+metrics = ["dep:prometheus"]
+
+[dev-dependencies]
+rcgen = "0.14"
+rsa = "0.9"
+wiremock = "0.6"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Standalone configuration (activated by scripts/extract-mcpx.ps1/sh).
+#
+# When mcpx is extracted into its own repository, the `[lints] workspace =
+# true` line above is removed and the blocks below are uncommented.  Keep
+# them in sync with the workspace root `Cargo.toml` and `clippy.toml` while
+# mcpx still lives inside this repo.
+# ──────────────────────────────────────────────────────────────────────────
+#
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "warn"
+indexing_slicing = "deny"
+fallible_impl_from = "deny"
+wildcard_enum_match_arm = "deny"
+fn_params_excessive_bools = "deny"
+must_use_candidate = "warn"
+unneeded_field_pattern = "warn"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+redundant_clone = "warn"
+implicit_clone = "warn"
+needless_pass_by_value = "warn"
+large_enum_variant = "warn"
+box_collection = "warn"
+rc_buffer = "warn"
+clone_on_ref_ptr = "deny"
+str_to_string = "warn"
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -1,0 +1,74 @@
+# GitLab CI template for mcpx.
+# Host-neutral alternative to .github/workflows/ — use whichever matches
+# your repository host.
+
+stages:
+  - lint
+  - test
+  - audit
+  - release
+
+variables:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_STABLE: "1.95.0"
+
+default:
+  image: rust:${RUST_STABLE}
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/
+      - target/
+  before_script:
+    - rustc --version
+    - cargo --version
+
+fmt:
+  stage: lint
+  image: rustlang/rust:nightly
+  script:
+    - rustup component add rustfmt
+    - cargo +nightly fmt --all -- --check
+
+clippy:
+  stage: lint
+  script:
+    - rustup component add clippy
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+test:
+  stage: test
+  script:
+    - cargo test --all-features
+
+docs:
+  stage: test
+  image: rustlang/rust:nightly
+  variables:
+    RUSTDOCFLAGS: "-D warnings --cfg docsrs"
+  script:
+    - cargo +nightly doc --no-deps --all-features
+
+deny:
+  stage: audit
+  script:
+    - cargo install --locked cargo-deny
+    - cargo deny check
+
+audit:
+  stage: audit
+  script:
+    - cargo install --locked cargo-audit
+    - cargo audit
+
+publish:
+  stage: release
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+$/
+  script:
+    - TAG="${CI_COMMIT_TAG}"
+    - CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mcpx") | .version')
+    - test "$TAG" = "$CRATE_VERSION"
+    - cargo publish --dry-run --all-features
+    - cargo publish --all-features --token "$CARGO_REGISTRY_TOKEN"

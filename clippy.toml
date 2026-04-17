@@ -1,0 +1,7 @@
+# Clippy threshold configuration.
+# Applied locally within the mcpx crate.
+
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100
+max-fn-params-bools = 3
+enum-variant-size-threshold = 200

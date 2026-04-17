@@ -1,0 +1,1638 @@
+use std::{
+    future::Future,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
+
+use arc_swap::ArcSwap;
+use axum::{body::Body, extract::Request, middleware::Next, response::IntoResponse};
+use rmcp::{
+    ServerHandler,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    auth::{
+        AuthConfig, AuthState, MtlsConfig, MtlsIdentities, TlsConnInfo, auth_middleware,
+        build_rate_limiter, extract_mtls_identity,
+    },
+    rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter, rbac_middleware},
+};
+
+/// Async readiness check callback for the `/readyz` endpoint.
+///
+/// Returns a JSON object with at least a `"ready"` boolean.
+/// When `ready` is false, the endpoint returns HTTP 503.
+pub type ReadinessCheck =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>> + Send + Sync>;
+
+/// Configuration for the MCP server.
+#[allow(
+    missing_debug_implementations,
+    reason = "contains callback/trait objects that don't impl Debug"
+)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "server configuration naturally has many boolean feature flags"
+)]
+#[non_exhaustive]
+pub struct McpServerConfig {
+    /// Socket address the MCP HTTP server binds to.
+    pub bind_addr: String,
+    /// Server name advertised via MCP `initialize`.
+    pub name: String,
+    /// Server version advertised via MCP `initialize`.
+    pub version: String,
+    /// Path to the TLS certificate (PEM). Required for TLS/mTLS.
+    pub tls_cert_path: Option<PathBuf>,
+    /// Path to the TLS private key (PEM). Required for TLS/mTLS.
+    pub tls_key_path: Option<PathBuf>,
+    /// Optional authentication config. When `Some` and `enabled`, auth
+    /// is enforced on `/mcp`. `/healthz` is always open.
+    pub auth: Option<AuthConfig>,
+    /// Optional RBAC policy. When present and enabled, tool calls are
+    /// checked against the policy after authentication.
+    pub rbac: Option<Arc<RbacPolicy>>,
+    /// Allowed Origin values for DNS rebinding protection (MCP spec MUST).
+    /// When empty and `public_url` is set, the origin is auto-derived from
+    /// the public URL. When both are empty, only requests with no Origin
+    /// header are accepted.
+    /// Example entries: `"http://localhost:3000"`, `"https://myapp.example.com"`.
+    pub allowed_origins: Vec<String>,
+    /// Maximum tool invocations per source IP per minute.
+    /// When set, enforced on every `tools/call` request.
+    pub tool_rate_limit: Option<u32>,
+    /// Optional readiness probe for `/readyz`.
+    /// When `None`, `/readyz` mirrors `/healthz` (always OK).
+    pub readiness_check: Option<ReadinessCheck>,
+    /// Maximum request body size in bytes. Default: 1 MiB.
+    /// Protects against oversized payloads causing OOM.
+    pub max_request_body: usize,
+    /// Request processing timeout. Default: 120s.
+    /// Requests exceeding this duration receive 408 Request Timeout.
+    pub request_timeout: Duration,
+    /// Graceful shutdown timeout. Default: 30s.
+    /// After the shutdown signal, in-flight requests have this long to finish.
+    pub shutdown_timeout: Duration,
+    /// Idle timeout for MCP sessions. Sessions with no activity for this
+    /// duration are closed automatically. Default: 20 minutes.
+    pub session_idle_timeout: Duration,
+    /// Interval for SSE keep-alive pings. Prevents proxies and load
+    /// balancers from killing idle connections. Default: 15 seconds.
+    pub sse_keep_alive: Duration,
+    /// Callback invoked once the server is built, delivering a
+    /// [`ReloadHandle`] for hot-reloading auth keys and RBAC policy
+    /// at runtime (e.g. on SIGHUP). Only useful when auth/RBAC is enabled.
+    pub on_reload_ready: Option<Box<dyn FnOnce(ReloadHandle) + Send>>,
+    /// Additional application-specific routes merged into the top-level
+    /// router.  These routes **bypass** the MCP auth and RBAC middleware,
+    /// so the application is responsible for its own auth on them.
+    pub extra_router: Option<axum::Router>,
+    /// Externally reachable base URL (e.g. `https://mcp.example.com`).
+    /// When set, OAuth metadata endpoints advertise this URL instead of
+    /// the listen address. Required when binding `0.0.0.0` behind a
+    /// reverse proxy or inside a container.
+    pub public_url: Option<String>,
+    /// Log inbound HTTP request headers at DEBUG level.
+    /// Sensitive values remain redacted.
+    pub log_request_headers: bool,
+    /// Enable gzip/br response compression on MCP responses.
+    /// Defaults to `false` to preserve existing behaviour.
+    pub compression_enabled: bool,
+    /// Minimum response body size (in bytes) before compression kicks in.
+    /// Only used when `compression_enabled` is true. Default: 1024.
+    pub compression_min_size: u16,
+    /// Global cap on in-flight HTTP requests across the whole server.
+    /// When `Some`, requests over the cap receive 503 Service Unavailable
+    /// via `tower::load_shed`. Default: `None` (unlimited).
+    pub max_concurrent_requests: Option<usize>,
+    /// Enable `/admin/*` diagnostic endpoints. Requires `auth` to be
+    /// configured and `enabled`. Default: `false`.
+    pub admin_enabled: bool,
+    /// RBAC role required to access admin endpoints. Default: `"admin"`.
+    pub admin_role: String,
+    /// Enable Prometheus metrics endpoint on a separate listener.
+    /// Requires the `metrics` crate feature.
+    #[cfg(feature = "metrics")]
+    pub metrics_enabled: bool,
+    /// Bind address for the Prometheus metrics listener. Default: `127.0.0.1:9090`.
+    #[cfg(feature = "metrics")]
+    pub metrics_bind: String,
+}
+
+impl McpServerConfig {
+    /// Create a new server configuration with the given bind address,
+    /// server name, and version. All other fields use safe defaults.
+    #[must_use]
+    pub fn new(
+        bind_addr: impl Into<String>,
+        name: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        Self {
+            bind_addr: bind_addr.into(),
+            name: name.into(),
+            version: version.into(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            auth: None,
+            rbac: None,
+            allowed_origins: Vec::new(),
+            tool_rate_limit: None,
+            readiness_check: None,
+            max_request_body: 1024 * 1024,
+            request_timeout: Duration::from_mins(2),
+            shutdown_timeout: Duration::from_secs(30),
+            session_idle_timeout: Duration::from_mins(20),
+            sse_keep_alive: Duration::from_secs(15),
+            on_reload_ready: None,
+            extra_router: None,
+            public_url: None,
+            log_request_headers: false,
+            compression_enabled: false,
+            compression_min_size: 1024,
+            max_concurrent_requests: None,
+            admin_enabled: false,
+            admin_role: "admin".to_owned(),
+            #[cfg(feature = "metrics")]
+            metrics_enabled: false,
+            #[cfg(feature = "metrics")]
+            metrics_bind: "127.0.0.1:9090".into(),
+        }
+    }
+}
+
+/// Handle for hot-reloading server configuration without restart.
+///
+/// Obtained via [`McpServerConfig::on_reload_ready`].
+/// All swap operations are lock-free and wait-free -- in-flight requests
+/// finish with the old values while new requests see the update immediately.
+#[allow(
+    missing_debug_implementations,
+    reason = "contains Arc<AuthState> with non-Debug fields"
+)]
+pub struct ReloadHandle {
+    auth: Option<Arc<AuthState>>,
+    rbac: Option<Arc<ArcSwap<RbacPolicy>>>,
+}
+
+impl ReloadHandle {
+    /// Atomically replace the API key list used by the auth middleware.
+    pub fn reload_auth_keys(&self, keys: Vec<crate::auth::ApiKeyEntry>) {
+        if let Some(ref auth) = self.auth {
+            auth.reload_keys(keys);
+        }
+    }
+
+    /// Atomically replace the RBAC policy used by the RBAC middleware.
+    pub fn reload_rbac(&self, policy: RbacPolicy) {
+        if let Some(ref rbac) = self.rbac {
+            rbac.store(Arc::new(policy));
+            tracing::info!("RBAC policy reloaded");
+        }
+    }
+}
+
+/// Generic MCP HTTP server.
+///
+/// Wraps an axum server with `/healthz` and `/mcp` endpoints.
+/// When `tls_cert_path` and `tls_key_path` are both set, the server binds
+/// with TLS (rustls). Optionally supports mTLS client certificate auth.
+///
+/// # Errors
+///
+/// Returns an error if the TCP listener cannot bind, TLS config is invalid,
+/// or the server fails.
+// TODO(refactor): cognitive complexity reduced from 111/25 to 83/25 by
+// extracting `run_server` (serve-loop tail) and `install_oauth_proxy_routes`.
+// Remaining flow is a linear router builder: middleware layering, feature-
+// gated auth/RBAC wiring, and PRM/metrics installation. Further extraction
+// would require threading many `&mut Router` helpers and hurt readability
+// of the layer order (which is security-relevant and must stay visible).
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+pub async fn serve<H, F>(mut config: McpServerConfig, handler_factory: F) -> anyhow::Result<()>
+where
+    H: ServerHandler + 'static,
+    F: Fn() -> H + Send + Sync + Clone + 'static,
+{
+    let ct = CancellationToken::new();
+
+    let allowed_hosts = derive_allowed_hosts(&config.bind_addr, config.public_url.as_deref());
+    tracing::info!(allowed_hosts = ?allowed_hosts, "configured Streamable HTTP allowed hosts");
+
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(handler_factory()),
+        {
+            let mut mgr = LocalSessionManager::default();
+            mgr.session_config.keep_alive = Some(config.session_idle_timeout);
+            mgr.into()
+        },
+        StreamableHttpServerConfig::default()
+            .with_allowed_hosts(allowed_hosts)
+            .with_sse_keep_alive(Some(config.sse_keep_alive))
+            .with_cancellation_token(ct.child_token()),
+    );
+
+    // Shared mTLS identity map - populated by TLS acceptor, read by auth middleware.
+    let mtls_identities: MtlsIdentities =
+        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // Build the MCP route, optionally wrapped with auth and RBAC middleware.
+    let mut mcp_router = axum::Router::new().nest_service("/mcp", mcp_service);
+
+    // Build auth state eagerly when auth is configured so we can wire both
+    // the auth middleware *and* the optional admin router against the same
+    // state. The middleware itself is installed further down in layer order.
+    let auth_state: Option<Arc<AuthState>> = match config.auth {
+        Some(ref auth_config) if auth_config.enabled => {
+            let rate_limiter = auth_config.rate_limit.as_ref().map(build_rate_limiter);
+
+            #[cfg(feature = "oauth")]
+            let jwks_cache = auth_config
+                .oauth
+                .as_ref()
+                .map(|c| crate::oauth::JwksCache::new(c).map(Arc::new))
+                .transpose()
+                .map_err(|e| std::io::Error::other(format!("JWKS HTTP client: {e}")))?;
+
+            Some(Arc::new(AuthState {
+                api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
+                mtls_identities: Arc::clone(&mtls_identities),
+                rate_limiter,
+                #[cfg(feature = "oauth")]
+                jwks_cache,
+                seen_identities: std::sync::Mutex::new(std::collections::HashSet::new()),
+                counters: crate::auth::AuthCounters::default(),
+            }))
+        }
+        _ => None,
+    };
+
+    // Build the RBAC policy swap early so the admin router and the later
+    // RBAC middleware layer share the same hot-reloadable state.
+    let rbac_swap = Arc::new(ArcSwap::new(
+        config
+            .rbac
+            .clone()
+            .unwrap_or_else(|| Arc::new(RbacPolicy::disabled())),
+    ));
+
+    // Optional /admin/* diagnostic routes. Merged BEFORE the
+    // body-limit/timeout/RBAC/origin/auth layers so all of them apply.
+    if config.admin_enabled {
+        let Some(ref auth_state_ref) = auth_state else {
+            return Err(anyhow::anyhow!(
+                "admin_enabled=true requires auth to be configured and enabled"
+            ));
+        };
+        let admin_state = crate::admin::AdminState {
+            started_at: std::time::Instant::now(),
+            name: config.name.clone(),
+            version: config.version.clone(),
+            auth: Some(Arc::clone(auth_state_ref)),
+            rbac: Arc::clone(&rbac_swap),
+        };
+        let admin_cfg = crate::admin::AdminConfig {
+            role: config.admin_role.clone(),
+        };
+        mcp_router = mcp_router.merge(crate::admin::admin_router(admin_state, &admin_cfg));
+        tracing::info!(role = %config.admin_role, "/admin/* endpoints enabled");
+    }
+
+    // Request body size limit (prevents OOM from oversized payloads).
+    mcp_router = mcp_router.layer(tower_http::limit::RequestBodyLimitLayer::new(
+        config.max_request_body,
+    ));
+
+    // Request timeout (returns 408 on expiry).
+    mcp_router = mcp_router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        config.request_timeout,
+    ));
+
+    // RBAC + tool rate-limit layer (closest to handler, enforced after auth).
+    // Always installed: even when RBAC is disabled, tool rate limiting may
+    // be active (MCP spec: servers MUST rate limit tool invocations).
+    {
+        let tool_limiter: Option<Arc<ToolRateLimiter>> =
+            config.tool_rate_limit.map(build_tool_rate_limiter);
+
+        if rbac_swap.load().is_enabled() {
+            tracing::info!("RBAC enforcement enabled on /mcp");
+        }
+        if let Some(limit) = config.tool_rate_limit {
+            tracing::info!(limit, "tool rate limiting enabled (calls/min per IP)");
+        }
+
+        let rbac_for_mw = Arc::clone(&rbac_swap);
+        mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
+            let p = rbac_for_mw.load_full();
+            let tl = tool_limiter.clone();
+            rbac_middleware(p, tl, req, next)
+        }));
+    }
+
+    // Origin validation layer (MCP spec: servers MUST validate the Origin
+    // header to prevent DNS rebinding attacks). Applied as outermost layer
+    // so it runs before auth/RBAC.
+    //
+    // When `allowed_origins` is empty but `public_url` is set, auto-derive
+    // the origin from the public URL so that MCP clients (e.g. Claude Code)
+    // that send `Origin: <server-url>` are accepted without explicit config.
+    let mut effective_origins = config.allowed_origins.clone();
+    if effective_origins.is_empty()
+        && let Some(ref url) = config.public_url
+    {
+        // Origin = scheme + "://" + host (+ ":" + port if non-default).
+        // Strip any path/query from the public URL.
+        if let Some(scheme_end) = url.find("://") {
+            let after_scheme = &url[scheme_end + 3..];
+            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+            let origin = format!("{}{}", &url[..scheme_end + 3], &after_scheme[..host_end]);
+            tracing::info!(
+                %origin,
+                "auto-derived allowed origin from public_url"
+            );
+            effective_origins.push(origin);
+        }
+    }
+    let allowed_origins: Arc<[String]> = Arc::from(effective_origins);
+    let cors_origins = Arc::clone(&allowed_origins);
+    let log_request_headers = config.log_request_headers;
+    mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
+        let origins = Arc::clone(&allowed_origins);
+        origin_check_middleware(origins, log_request_headers, req, next)
+    }));
+
+    if let Some(ref auth_config) = config.auth
+        && auth_config.enabled
+    {
+        let Some(ref state) = auth_state else {
+            return Err(anyhow::anyhow!("auth state missing despite enabled config"));
+        };
+
+        let methods: Vec<&str> = [
+            auth_config.mtls.is_some().then_some("mTLS"),
+            (!auth_config.api_keys.is_empty()).then_some("bearer"),
+            #[cfg(feature = "oauth")]
+            auth_config.oauth.is_some().then_some("oauth-jwt"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        tracing::info!(
+            methods = %methods.join(", "),
+            api_keys = auth_config.api_keys.len(),
+            "auth enabled on /mcp"
+        );
+
+        // Deliver reload handle to caller before capturing state in middleware.
+        if let Some(cb) = config.on_reload_ready.take() {
+            cb(ReloadHandle {
+                auth: Some(Arc::clone(state)),
+                rbac: Some(Arc::clone(&rbac_swap)),
+            });
+        }
+
+        let state_for_mw = Arc::clone(state);
+        mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
+            let s = Arc::clone(&state_for_mw);
+            auth_middleware(s, req, next)
+        }));
+    } else if let Some(cb) = config.on_reload_ready.take() {
+        // Auth disabled but caller wants reload handle (RBAC-only reload).
+        cb(ReloadHandle {
+            auth: None,
+            rbac: Some(Arc::clone(&rbac_swap)),
+        });
+    }
+
+    let readyz_route = if let Some(check) = config.readiness_check.take() {
+        axum::routing::get(move || readyz(Arc::clone(&check)))
+    } else {
+        axum::routing::get(healthz)
+    };
+
+    #[allow(unused_mut)] // mut needed when oauth feature adds PRM route
+    let mut router = axum::Router::new()
+        .route("/healthz", axum::routing::get(healthz))
+        .route("/readyz", readyz_route)
+        .route(
+            "/version",
+            axum::routing::get({
+                let payload = version_payload(&config.name, &config.version);
+                move || {
+                    let p = payload.clone();
+                    async move { axum::Json(p) }
+                }
+            }),
+        )
+        .merge(mcp_router);
+
+    // Merge application-specific routes (bypass MCP auth/RBAC middleware).
+    if let Some(extra) = config.extra_router.take() {
+        router = router.merge(extra);
+    }
+
+    // RFC 9728: Protected Resource Metadata endpoint.
+    // When OAuth is configured, serve full metadata with authorization_servers.
+    // Otherwise, serve a minimal document with just the resource URL and no
+    // authorization_servers -- this tells MCP clients (e.g. Claude Code SDK)
+    // that the server exists but does NOT require OAuth authentication,
+    // preventing them from gating the connection behind a broken auth flow.
+    let server_url = if let Some(ref url) = config.public_url {
+        url.trim_end_matches('/').to_owned()
+    } else {
+        let prm_scheme = if config.tls_cert_path.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{prm_scheme}://{}", config.bind_addr)
+    };
+    let resource_url = format!("{server_url}/mcp");
+
+    #[cfg(feature = "oauth")]
+    let prm_metadata = if let Some(ref auth_config) = config.auth
+        && let Some(ref oauth_config) = auth_config.oauth
+    {
+        crate::oauth::protected_resource_metadata(&resource_url, &server_url, oauth_config)
+    } else {
+        serde_json::json!({ "resource": resource_url })
+    };
+    #[cfg(not(feature = "oauth"))]
+    let prm_metadata = serde_json::json!({ "resource": resource_url });
+
+    router = router.route(
+        "/.well-known/oauth-protected-resource",
+        axum::routing::get(move || {
+            let m = prm_metadata.clone();
+            async move { axum::Json(m) }
+        }),
+    );
+
+    // OAuth 2.1 proxy endpoints: when an OAuth proxy is configured, expose
+    // /authorize, /token, /register, and authorization server metadata so
+    // MCP clients can perform Authorization Code + PKCE against the upstream
+    // IdP (e.g. Keycloak) transparently.
+    #[cfg(feature = "oauth")]
+    if let Some(ref auth_config) = config.auth
+        && let Some(ref oauth_config) = auth_config.oauth
+        && oauth_config.proxy.is_some()
+    {
+        router = install_oauth_proxy_routes(router, &server_url, oauth_config);
+    }
+
+    // OWASP security response headers (applied to all responses).
+    // HSTS is conditional on TLS being configured.
+    let is_tls = config.tls_cert_path.is_some();
+    router = router.layer(axum::middleware::from_fn(move |req, next| {
+        security_headers_middleware(is_tls, req, next)
+    }));
+
+    // CORS preflight layer (required for browser-based MCP clients).
+    // Uses the same effective origins as the origin check middleware
+    // (including auto-derived origin from public_url).
+    if !cors_origins.is_empty() {
+        let cors = tower_http::cors::CorsLayer::new()
+            .allow_origin(
+                cors_origins
+                    .iter()
+                    .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
+                    .collect::<Vec<_>>(),
+            )
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ]);
+        router = router.layer(cors);
+    }
+
+    // Optional response compression (gzip + brotli). Skips small bodies
+    // to avoid overhead. Applied after CORS so preflight responses remain
+    // uncompressed.
+    if config.compression_enabled {
+        use tower_http::compression::Predicate as _;
+        let predicate = tower_http::compression::DefaultPredicate::new().and(
+            tower_http::compression::predicate::SizeAbove::new(config.compression_min_size),
+        );
+        router = router.layer(
+            tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .br(true)
+                .compress_when(predicate),
+        );
+        tracing::info!(
+            min_size = config.compression_min_size,
+            "response compression enabled (gzip, br)"
+        );
+    }
+
+    // Optional global concurrency cap. `load_shed` converts the
+    // `ConcurrencyLimit` back-pressure error into 503 instead of hanging.
+    if let Some(max) = config.max_concurrent_requests {
+        let overload_handler = tower::ServiceBuilder::new()
+            .layer(axum::error_handling::HandleErrorLayer::new(
+                |_err: tower::BoxError| async {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({
+                            "error": "overloaded",
+                            "error_description": "server is at capacity, retry later"
+                        })),
+                    )
+                },
+            ))
+            .layer(tower::load_shed::LoadShedLayer::new())
+            .layer(tower::limit::ConcurrencyLimitLayer::new(max));
+        router = router.layer(overload_handler);
+        tracing::info!(max, "global concurrency limit enabled");
+    }
+
+    // JSON fallback for unmatched routes. Without this, axum returns
+    // an empty-body 404 that breaks MCP clients (e.g. Claude Code SDK)
+    // when they probe OAuth endpoints like /authorize or /token.
+    router = router.fallback(|| async {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "not_found",
+                "error_description": "The requested endpoint does not exist"
+            })),
+        )
+    });
+
+    // Prometheus metrics: recording middleware + separate listener.
+    #[cfg(feature = "metrics")]
+    if config.metrics_enabled {
+        let metrics = Arc::new(
+            crate::metrics::McpMetrics::new()
+                .map_err(|e| std::io::Error::other(format!("metrics init: {e}")))?,
+        );
+        let m = Arc::clone(&metrics);
+        router = router.layer(axum::middleware::from_fn(
+            move |req: Request<Body>, next: Next| {
+                let m = Arc::clone(&m);
+                metrics_middleware(m, req, next)
+            },
+        ));
+        let metrics_bind = config.metrics_bind.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics::serve_metrics(metrics_bind, metrics).await {
+                tracing::error!("metrics listener failed: {e}");
+            }
+        });
+    }
+
+    let listener = TcpListener::bind(&config.bind_addr).await?;
+    let scheme = if config.tls_cert_path.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    tracing::info!("{} listening on {}", config.name, config.bind_addr);
+    tracing::info!("  MCP endpoint: {scheme}://{}/mcp", config.bind_addr);
+    tracing::info!("  Health check: {scheme}://{}/healthz", config.bind_addr);
+    tracing::info!("  Readiness:   {scheme}://{}/readyz", config.bind_addr);
+
+    let tls_paths = match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+        _ => None,
+    };
+    let mtls_config = config.auth.as_ref().and_then(|a| a.mtls.as_ref()).cloned();
+
+    run_server(
+        router,
+        listener,
+        tls_paths,
+        mtls_config,
+        config.shutdown_timeout,
+        ct,
+        mtls_identities,
+    )
+    .await
+}
+
+/// Drive the chosen axum server variant (TLS or plain) with a graceful
+/// shutdown window. Consumes the router and listener.
+async fn run_server(
+    router: axum::Router,
+    listener: TcpListener,
+    tls_paths: Option<(PathBuf, PathBuf)>,
+    mtls_config: Option<MtlsConfig>,
+    shutdown_timeout: Duration,
+    ct: CancellationToken,
+    mtls_identities: MtlsIdentities,
+) -> anyhow::Result<()> {
+    let shutdown = async move {
+        shutdown_signal().await;
+        tracing::info!("shutting down (grace period: {shutdown_timeout:?})");
+        ct.cancel();
+    };
+
+    if let Some((cert_path, key_path)) = tls_paths {
+        let tls_listener = TlsListener::new(
+            listener,
+            &cert_path,
+            &key_path,
+            mtls_config.as_ref(),
+            mtls_identities,
+        )?;
+        let make_svc = router.into_make_service_with_connect_info::<TlsConnInfo>();
+        tokio::select! {
+            result = axum::serve(tls_listener, make_svc)
+                .with_graceful_shutdown(shutdown) => { result?; }
+            () = async {
+                shutdown_signal().await;
+                tokio::time::sleep(shutdown_timeout).await;
+            } => {
+                tracing::warn!("shutdown timeout exceeded, forcing exit");
+            }
+        }
+    } else {
+        let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
+        tokio::select! {
+            result = axum::serve(listener, make_svc)
+                .with_graceful_shutdown(shutdown) => { result?; }
+            () = async {
+                shutdown_signal().await;
+                tokio::time::sleep(shutdown_timeout).await;
+            } => {
+                tracing::warn!("shutdown timeout exceeded, forcing exit");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Install the OAuth 2.1 proxy endpoints (`/authorize`, `/token`,
+/// `/register`, and authorization server metadata) on `router`. The
+/// caller must ensure `oauth_config.proxy` is `Some`.
+#[cfg(feature = "oauth")]
+fn install_oauth_proxy_routes(
+    router: axum::Router,
+    server_url: &str,
+    oauth_config: &crate::oauth::OAuthConfig,
+) -> axum::Router {
+    let Some(ref proxy) = oauth_config.proxy else {
+        return router;
+    };
+
+    let asm = crate::oauth::authorization_server_metadata(server_url, oauth_config);
+    let router = router.route(
+        "/.well-known/oauth-authorization-server",
+        axum::routing::get(move || {
+            let m = asm.clone();
+            async move { axum::Json(m) }
+        }),
+    );
+
+    let proxy_authorize = proxy.clone();
+    let router = router.route(
+        "/authorize",
+        axum::routing::get(
+            move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                let p = proxy_authorize.clone();
+                async move { crate::oauth::handle_authorize(&p, &query.unwrap_or_default()) }
+            },
+        ),
+    );
+
+    let proxy_token = proxy.clone();
+    let token_http = reqwest::Client::new();
+    let router = router.route(
+        "/token",
+        axum::routing::post(move |body: String| {
+            let p = proxy_token.clone();
+            let h = token_http.clone();
+            async move { crate::oauth::handle_token(&h, &p, &body).await }
+        }),
+    );
+
+    let proxy_register = proxy.clone();
+    let router = router.route(
+        "/register",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let p = proxy_register;
+            async move { axum::Json(crate::oauth::handle_register(&p, &body)) }
+        }),
+    );
+
+    let router = if proxy.introspection_url.is_some() {
+        let proxy_introspect = proxy.clone();
+        let introspect_http = reqwest::Client::new();
+        router.route(
+            "/introspect",
+            axum::routing::post(move |body: String| {
+                let p = proxy_introspect.clone();
+                let h = introspect_http.clone();
+                async move { crate::oauth::handle_introspect(&h, &p, &body).await }
+            }),
+        )
+    } else {
+        router
+    };
+
+    let router = if proxy.revocation_url.is_some() {
+        let proxy_revoke = proxy.clone();
+        let revoke_http = reqwest::Client::new();
+        router.route(
+            "/revoke",
+            axum::routing::post(move |body: String| {
+                let p = proxy_revoke.clone();
+                let h = revoke_http.clone();
+                async move { crate::oauth::handle_revoke(&h, &p, &body).await }
+            }),
+        )
+    } else {
+        router
+    };
+
+    tracing::info!(
+        introspect = proxy.introspection_url.is_some(),
+        revoke = proxy.revocation_url.is_some(),
+        "OAuth 2.1 proxy endpoints enabled (/authorize, /token, /register)"
+    );
+    router
+}
+
+/// Build the host allow-list for rmcp's DNS rebinding protection.
+///
+/// Includes loopback hosts by default, then augments with host/authority
+/// derived from `public_url` and the server bind address.
+fn derive_allowed_hosts(bind_addr: &str, public_url: Option<&str>) -> Vec<String> {
+    let mut hosts = vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        "::1".to_owned(),
+    ];
+
+    if let Some(url) = public_url
+        && let Ok(uri) = url.parse::<axum::http::Uri>()
+        && let Some(authority) = uri.authority()
+    {
+        let host = authority.host().to_owned();
+        if !hosts.iter().any(|h| h == &host) {
+            hosts.push(host);
+        }
+
+        let authority = authority.as_str().to_owned();
+        if !hosts.iter().any(|h| h == &authority) {
+            hosts.push(authority);
+        }
+    }
+
+    if let Ok(uri) = format!("http://{bind_addr}").parse::<axum::http::Uri>()
+        && let Some(authority) = uri.authority()
+    {
+        let host = authority.host().to_owned();
+        if !hosts.iter().any(|h| h == &host) {
+            hosts.push(host);
+        }
+
+        let authority = authority.as_str().to_owned();
+        if !hosts.iter().any(|h| h == &authority) {
+            hosts.push(authority);
+        }
+    }
+
+    hosts
+}
+
+// - TLS support -
+
+/// Implement axum's `Connected` trait for `TlsConnInfo` so that
+/// `ConnectInfo<TlsConnInfo>` is available in middleware when serving
+/// over our custom `TlsListener`.
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
+    for TlsConnInfo
+{
+    fn connect_info(target: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        TlsConnInfo(*target.remote_addr())
+    }
+}
+
+/// Maximum mTLS identity map entries before eviction. Entries are keyed by
+/// peer `SocketAddr` (IP + ephemeral port) and become stale once the TCP
+/// connection closes, so 10 000 is well above realistic concurrency.
+const MAX_MTLS_ENTRIES: usize = 10_000;
+
+/// A TLS-wrapping listener that implements axum's `Listener` trait.
+///
+/// When mTLS is configured, verifies client certificates against the
+/// configured CA and stores extracted identities in a shared map for
+/// the auth middleware to consume.
+struct TlsListener {
+    inner: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    mtls_identities: MtlsIdentities,
+    mtls_default_role: String,
+}
+
+impl TlsListener {
+    fn new(
+        inner: TcpListener,
+        cert_path: &Path,
+        key_path: &Path,
+        mtls_config: Option<&MtlsConfig>,
+        mtls_identities: MtlsIdentities,
+    ) -> anyhow::Result<Self> {
+        // Install the ring crypto provider (ok to call multiple times).
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let certs = load_certs(cert_path)?;
+        let key = load_key(key_path)?;
+
+        let mtls_default_role;
+
+        let tls_config = if let Some(mtls) = mtls_config {
+            mtls_default_role = mtls.default_role.clone();
+            let ca_certs = load_certs(&mtls.ca_cert_path)?;
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in &ca_certs {
+                root_store
+                    .add(cert.clone())
+                    .map_err(|e| anyhow::anyhow!("invalid CA cert: {e}"))?;
+            }
+            let verifier = if mtls.required {
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+            } else {
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                    .allow_unauthenticated()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+            };
+
+            tracing::info!(
+                ca = %mtls.ca_cert_path.display(),
+                required = mtls.required,
+                "mTLS client auth configured"
+            );
+
+            rustls::ServerConfig::builder_with_protocol_versions(&[
+                &rustls::version::TLS12,
+                &rustls::version::TLS13,
+            ])
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)?
+        } else {
+            mtls_default_role = "viewer".to_owned();
+            rustls::ServerConfig::builder_with_protocol_versions(&[
+                &rustls::version::TLS12,
+                &rustls::version::TLS13,
+            ])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?
+        };
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+        tracing::info!(
+            "TLS enabled (cert: {}, key: {})",
+            cert_path.display(),
+            key_path.display()
+        );
+        Ok(Self {
+            inner,
+            acceptor,
+            mtls_identities,
+            mtls_default_role,
+        })
+    }
+}
+
+impl TlsListener {
+    /// Extract the mTLS client cert identity from a completed TLS handshake
+    /// and, if present, record it in the shared identity map keyed by the
+    /// peer socket address. Evicts the oldest half of entries when the map
+    /// exceeds [`MAX_MTLS_ENTRIES`].
+    fn record_mtls_identity(
+        &self,
+        tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        addr: SocketAddr,
+    ) {
+        let (_, server_conn) = tls_stream.get_ref();
+        let Some(certs) = server_conn.peer_certificates() else {
+            return;
+        };
+        let Some(cert_der) = certs.first() else {
+            return;
+        };
+        let Some(id) = extract_mtls_identity(cert_der.as_ref(), &self.mtls_default_role) else {
+            return;
+        };
+
+        tracing::debug!(name = %id.name, peer = %addr, "mTLS client cert accepted");
+
+        let Ok(mut map) = self.mtls_identities.write() else {
+            return;
+        };
+        map.insert(addr, id);
+
+        // Evict stale entries when the map grows too large. Entries are
+        // keyed by peer SocketAddr (IP + ephemeral port); once a TCP
+        // connection closes the port is recycled, so old entries are
+        // effectively dead.
+        if map.len() > MAX_MTLS_ENTRIES {
+            let keys: Vec<SocketAddr> = map.keys().take(map.len() / 2).copied().collect();
+            for key in keys {
+                map.remove(&key);
+            }
+            tracing::debug!(remaining = map.len(), "evicted stale mTLS identity entries");
+        }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::debug!("TCP accept error: {e}");
+                    continue;
+                }
+            };
+            let tls_stream = match self.acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("TLS handshake failed from {addr}: {e}");
+                    continue;
+                }
+            };
+            self.record_mtls_identity(&tls_stream, addr);
+            return (tls_stream, addr);
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+fn load_certs(path: &Path) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(path)
+        .map_err(|e| anyhow::anyhow!("failed to read certs from {}: {e}", path.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("invalid cert in {}: {e}", path.display()))?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "no certificates found in {}",
+        path.display()
+    );
+    Ok(certs)
+}
+
+fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| anyhow::anyhow!("failed to read key from {}: {e}", path.display()))
+}
+
+#[allow(clippy::unused_async)]
+async fn healthz() -> impl IntoResponse {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+    }))
+}
+
+/// Build the `/version` JSON payload for a given server name and version.
+///
+/// Build metadata (`build_git_sha`, `build_timestamp`, `rust_version`) is
+/// read at compile time from the `MCPX_BUILD_SHA`, `MCPX_BUILD_TIME`, and
+/// `MCPX_RUSTC_VERSION` env vars. Unset values resolve to `"unknown"`.
+fn version_payload(name: &str, version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build_git_sha": option_env!("MCPX_BUILD_SHA").unwrap_or("unknown"),
+        "build_timestamp": option_env!("MCPX_BUILD_TIME").unwrap_or("unknown"),
+        "rust_version": option_env!("MCPX_RUSTC_VERSION").unwrap_or("unknown"),
+        "mcpx_version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
+    let status = check().await;
+    let ready = status
+        .get("ready")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let code = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, axum::Json(status))
+}
+
+/// Wait for SIGINT (ctrl-c) or SIGTERM (container stop).
+///
+/// On non-Unix platforms, only SIGINT is handled.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to register SIGTERM handler, using SIGINT only");
+                ctrl_c.await.ok();
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
+}
+
+// -- Origin validation (MCP 2025-11-25 spec, section 2.0.1) --
+
+/// Middleware that validates the `Origin` header on incoming HTTP requests.
+///
+/// Record HTTP request metrics (method, path, status, duration).
+#[cfg(feature = "metrics")]
+async fn metrics_middleware(
+    metrics: Arc<crate::metrics::McpMetrics>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_owned();
+    let start = std::time::Instant::now();
+
+    let response = next.run(req).await;
+
+    let status = response.status().as_u16().to_string();
+    let duration = start.elapsed().as_secs_f64();
+
+    metrics
+        .http_requests_total
+        .with_label_values(&[&method, &path, &status])
+        .inc();
+    metrics
+        .http_request_duration_seconds
+        .with_label_values(&[&method, &path])
+        .observe(duration);
+
+    response
+}
+
+/// OWASP security header hardening applied to every response.
+///
+/// Sets: `X-Content-Type-Options`, `X-Frame-Options`, `Cache-Control`,
+/// `Referrer-Policy`, `Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy`,
+/// `Cross-Origin-Embedder-Policy`, `Permissions-Policy`,
+/// `X-Permitted-Cross-Domain-Policies`, `Content-Security-Policy`,
+/// `X-DNS-Prefetch-Control`, and (when TLS is active) `Strict-Transport-Security`.
+async fn security_headers_middleware(
+    is_tls: bool,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderName, HeaderValue, header};
+
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+
+    // Strip server identity headers to reduce information leakage.
+    headers.remove(header::SERVER);
+    headers.remove(HeaderName::from_static("x-powered-by"));
+
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("deny"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-embedder-policy"),
+        HeaderValue::from_static("require-corp"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("accelerometer=(), camera=(), geolocation=(), microphone=()"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-permitted-cross-domain-policies"),
+        HeaderValue::from_static("none"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-dns-prefetch-control"),
+        HeaderValue::from_static("off"),
+    );
+
+    if is_tls {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+        );
+    }
+
+    resp
+}
+
+/// Per the MCP spec: if the Origin header is present and its value is not in
+/// the allowed list, respond with 403 Forbidden. Requests without an Origin
+/// header are allowed through (e.g. non-browser clients like curl, SDKs).
+async fn origin_check_middleware(
+    allowed: Arc<[String]>,
+    log_request_headers: bool,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+
+    log_incoming_request(&method, &path, req.headers(), log_request_headers);
+
+    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+        let origin_str = origin.to_str().unwrap_or("");
+        if !allowed.iter().any(|a| a == origin_str) {
+            tracing::warn!(
+                origin = origin_str,
+                %method,
+                %path,
+                allowed = ?&*allowed,
+                "rejected request: Origin not allowed"
+            );
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                "Forbidden: Origin not allowed",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Emit a DEBUG log for an incoming request, optionally including the full
+/// (redacted) header set.
+fn log_incoming_request(
+    method: &axum::http::Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    log_request_headers: bool,
+) {
+    if log_request_headers {
+        tracing::debug!(
+            %method,
+            %path,
+            headers = %format_request_headers_for_log(headers),
+            "incoming request"
+        );
+    } else {
+        tracing::debug!(%method, %path, "incoming request");
+    }
+}
+
+fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let name = k.as_str();
+            if name == "authorization" || name == "cookie" || name == "proxy-authorization" {
+                format!("{name}: [REDACTED]")
+            } else {
+                format!("{name}: {}", v.to_str().unwrap_or("<non-utf8>"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// -- stdio transport --
+
+/// Serve an MCP server over stdin/stdout (stdio transport).
+///
+/// # Security warnings
+///
+/// - **No authentication**: the parent process has full, unrestricted access.
+/// - **No RBAC**: all tools are available regardless of policy.
+/// - **No TLS**: messages travel over OS pipes in plaintext.
+/// - **Single client**: only the parent process can connect.
+/// - **No Origin validation**: not applicable to stdio.
+///
+/// Use this only when the MCP client spawns the server as a trusted subprocess
+/// (e.g. Claude Desktop, VS Code Copilot). For network-accessible deployments,
+/// use `serve()` (Streamable HTTP) instead.
+///
+/// # Errors
+///
+/// Returns an error if the handler fails to initialize or the transport
+/// disconnects unexpectedly.
+// NOTE: reported complexity 32/25 is driven entirely by `tracing::*!`
+// macro expansion in this 18-line function (info/warn/info + two matches).
+// There is nothing meaningful to extract; the allow stays.
+#[allow(clippy::cognitive_complexity)]
+pub async fn serve_stdio<H>(handler: H) -> anyhow::Result<()>
+where
+    H: ServerHandler + 'static,
+{
+    use rmcp::ServiceExt as _;
+
+    tracing::info!("stdio transport: serving on stdin/stdout");
+    tracing::warn!("stdio mode: auth, RBAC, TLS, and Origin checks are DISABLED");
+
+    let transport = rmcp::transport::io::stdio();
+
+    let service = handler
+        .serve(transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("stdio initialize failed: {e}"))?;
+
+    if let Err(e) = service.waiting().await {
+        tracing::warn!(error = %e, "stdio session ended with error");
+    }
+    tracing::info!("stdio session ended");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::unwrap_in_result,
+        clippy::print_stdout,
+        clippy::print_stderr
+    )]
+    use std::sync::Arc;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+        response::IntoResponse,
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    // -- McpServerConfig --
+
+    #[test]
+    fn server_config_new_defaults() {
+        let cfg = McpServerConfig::new("0.0.0.0:8443", "test-server", "1.0.0");
+        assert_eq!(cfg.bind_addr, "0.0.0.0:8443");
+        assert_eq!(cfg.name, "test-server");
+        assert_eq!(cfg.version, "1.0.0");
+        assert!(cfg.tls_cert_path.is_none());
+        assert!(cfg.tls_key_path.is_none());
+        assert!(cfg.auth.is_none());
+        assert!(cfg.rbac.is_none());
+        assert!(cfg.allowed_origins.is_empty());
+        assert!(cfg.tool_rate_limit.is_none());
+        assert!(cfg.readiness_check.is_none());
+        assert_eq!(cfg.max_request_body, 1024 * 1024);
+        assert_eq!(cfg.request_timeout, Duration::from_mins(2));
+        assert_eq!(cfg.shutdown_timeout, Duration::from_secs(30));
+        assert!(!cfg.log_request_headers);
+    }
+
+    #[test]
+    fn derive_allowed_hosts_includes_public_host() {
+        let hosts = derive_allowed_hosts("0.0.0.0:8080", Some("https://mcp.example.com/mcp"));
+        assert!(
+            hosts.iter().any(|h| h == "mcp.example.com"),
+            "public_url host must be allowed"
+        );
+    }
+
+    #[test]
+    fn derive_allowed_hosts_includes_bind_authority() {
+        let hosts = derive_allowed_hosts("127.0.0.1:8080", None);
+        assert!(
+            hosts.iter().any(|h| h == "127.0.0.1"),
+            "bind host must be allowed"
+        );
+        assert!(
+            hosts.iter().any(|h| h == "127.0.0.1:8080"),
+            "bind authority must be allowed"
+        );
+    }
+
+    // -- healthz --
+
+    #[tokio::test]
+    async fn healthz_returns_ok_json() {
+        let resp = healthz().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(
+            json.get("name").is_none(),
+            "healthz must not expose server name"
+        );
+        assert!(
+            json.get("version").is_none(),
+            "healthz must not expose version"
+        );
+    }
+
+    // -- readyz --
+
+    #[tokio::test]
+    async fn readyz_returns_ok_when_ready() {
+        let check: ReadinessCheck =
+            Arc::new(|| Box::pin(async { serde_json::json!({"ready": true, "db": "connected"}) }));
+        let resp = readyz(check).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ready"], true);
+        assert!(
+            json.get("name").is_none(),
+            "readyz must not expose server name"
+        );
+        assert!(
+            json.get("version").is_none(),
+            "readyz must not expose version"
+        );
+        assert_eq!(json["db"], "connected");
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_not_ready() {
+        let check: ReadinessCheck =
+            Arc::new(|| Box::pin(async { serde_json::json!({"ready": false}) }));
+        let resp = readyz(check).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_ready_missing() {
+        let check: ReadinessCheck =
+            Arc::new(|| Box::pin(async { serde_json::json!({"status": "starting"}) }));
+        let resp = readyz(check).await.into_response();
+        // Missing "ready" field defaults to false -> 503
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // -- origin_check_middleware --
+
+    /// Build a test router with origin check middleware and a simple handler.
+    fn origin_router(origins: Vec<String>, log_request_headers: bool) -> axum::Router {
+        let allowed: Arc<[String]> = Arc::from(origins);
+        axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let a = Arc::clone(&allowed);
+                origin_check_middleware(a, log_request_headers, req, next)
+            }))
+    }
+
+    #[tokio::test]
+    async fn origin_allowed_passes() {
+        let app = origin_router(vec!["http://localhost:3000".into()], false);
+        let req = Request::builder()
+            .uri("/test")
+            .header(header::ORIGIN, "http://localhost:3000")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn origin_rejected_returns_403() {
+        let app = origin_router(vec!["http://localhost:3000".into()], false);
+        let req = Request::builder()
+            .uri("/test")
+            .header(header::ORIGIN, "http://evil.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn no_origin_header_passes() {
+        let app = origin_router(vec!["http://localhost:3000".into()], false);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_rejects_any_origin() {
+        let app = origin_router(vec![], false);
+        let req = Request::builder()
+            .uri("/test")
+            .header(header::ORIGIN, "http://anything.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_passes_without_origin() {
+        let app = origin_router(vec![], false);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn format_request_headers_redacts_sensitive_values() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
+        headers.insert("cookie", "sid=abc".parse().unwrap());
+        headers.insert("x-request-id", "req-123".parse().unwrap());
+
+        let out = format_request_headers_for_log(&headers);
+        assert!(out.contains("authorization: [REDACTED]"));
+        assert!(out.contains("cookie: [REDACTED]"));
+        assert!(out.contains("x-request-id: req-123"));
+        assert!(!out.contains("secret-token"));
+    }
+
+    // -- security_headers_middleware --
+
+    fn security_router(is_tls: bool) -> axum::Router {
+        axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                security_headers_middleware(is_tls, req, next)
+            }))
+    }
+
+    #[tokio::test]
+    async fn security_headers_set_on_response() {
+        let app = security_router(false);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let h = resp.headers();
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(h.get("x-frame-options").unwrap(), "deny");
+        assert_eq!(h.get("cache-control").unwrap(), "no-store, max-age=0");
+        assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
+        assert_eq!(h.get("cross-origin-opener-policy").unwrap(), "same-origin");
+        assert_eq!(
+            h.get("cross-origin-resource-policy").unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            h.get("cross-origin-embedder-policy").unwrap(),
+            "require-corp"
+        );
+        assert_eq!(h.get("x-permitted-cross-domain-policies").unwrap(), "none");
+        assert!(
+            h.get("permissions-policy")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("camera=()"),
+            "permissions-policy must restrict browser features"
+        );
+        assert_eq!(
+            h.get("content-security-policy").unwrap(),
+            "default-src 'none'; frame-ancestors 'none'"
+        );
+        assert_eq!(h.get("x-dns-prefetch-control").unwrap(), "off");
+        // No HSTS when TLS is off.
+        assert!(h.get("strict-transport-security").is_none());
+    }
+
+    #[tokio::test]
+    async fn hsts_set_when_tls_enabled() {
+        let app = security_router(true);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        let hsts = resp.headers().get("strict-transport-security").unwrap();
+        assert!(
+            hsts.to_str().unwrap().contains("max-age=63072000"),
+            "HSTS must set 2-year max-age"
+        );
+    }
+
+    // -- version endpoint --
+
+    #[test]
+    fn version_payload_contains_expected_fields() {
+        let v = version_payload("my-server", "1.2.3");
+        assert_eq!(v["name"], "my-server");
+        assert_eq!(v["version"], "1.2.3");
+        assert!(v["build_git_sha"].is_string());
+        assert!(v["build_timestamp"].is_string());
+        assert!(v["rust_version"].is_string());
+        assert!(v["mcpx_version"].is_string());
+    }
+
+    // -- concurrency limit layer --
+
+    #[tokio::test]
+    async fn concurrency_limit_layer_composes_and_serves() {
+        // We only assert the layer stack compiles and a single request
+        // below the cap still succeeds. True back-pressure behaviour
+        // requires a live HTTP server and is covered by integration tests.
+        let app = axum::Router::new()
+            .route("/ok", axum::routing::get(|| async { "ok" }))
+            .layer(
+                tower::ServiceBuilder::new()
+                    .layer(axum::error_handling::HandleErrorLayer::new(
+                        |_err: tower::BoxError| async { StatusCode::SERVICE_UNAVAILABLE },
+                    ))
+                    .layer(tower::load_shed::LoadShedLayer::new())
+                    .layer(tower::limit::ConcurrencyLimitLayer::new(4)),
+            );
+        let resp = app
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -- compression layer --
+
+    #[tokio::test]
+    async fn compression_layer_gzip_encodes_response() {
+        use tower_http::compression::Predicate as _;
+
+        let big_body = "a".repeat(4096);
+        let app = axum::Router::new()
+            .route(
+                "/big",
+                axum::routing::get(move || {
+                    let body = big_body.clone();
+                    async move { body }
+                }),
+            )
+            .layer(
+                tower_http::compression::CompressionLayer::new()
+                    .gzip(true)
+                    .br(true)
+                    .compress_when(
+                        tower_http::compression::DefaultPredicate::new()
+                            .and(tower_http::compression::predicate::SizeAbove::new(1024)),
+                    ),
+            );
+
+        let req = Request::builder()
+            .uri("/big")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+    }
+}

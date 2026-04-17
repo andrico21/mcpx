@@ -1,0 +1,29 @@
+# Build artifacts
+/target
+**/target
+
+# Editor / tooling
+/.idea
+/.vscode
+*.swp
+*.swo
+*.log
+
+# Cargo.lock is intentionally not committed for library crates.
+# See: https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control-but-not-libraries
+/Cargo.lock
+
+# Local test / coverage output
+/coverage
+*.profraw
+*.profdata
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Secrets (never commit)
+*.pem
+*.key
+!tests/**/*.pem
+!tests/**/*.key
