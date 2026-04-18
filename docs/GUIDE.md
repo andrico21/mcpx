@@ -393,6 +393,47 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
 Parses an X.509 DER certificate and extracts the Common Name (CN) or first
 DNS SAN as the identity name. Used internally by the TLS acceptor.
 
+#### Certificate lifecycle and revocation (operator runbook)
+
+> **mcpx does NOT validate CRL or OCSP for client certificates.** mTLS
+> trust in mcpx is *point-in-time*: a cert is accepted whenever it
+> chains to a configured CA and is within its `notBefore`/`notAfter`
+> window. Revocation must be enforced *out of band*. See
+> [SECURITY.md](../SECURITY.md#certificate-revocation) for the full
+> threat model.
+
+For production mTLS deployments, operators MUST adopt at least one of
+the following revocation strategies:
+
+1. **Short-lived certificates (recommended).** Issue client certs with a
+   maximum lifetime of **24 hours or less** so that compromised
+   credentials expire on their own. Supported issuers:
+
+   - **[cert-manager](https://cert-manager.io/)** -- Kubernetes-native
+     issuer; configure `Certificate.spec.duration: 24h` and
+     `renewBefore: 8h`. Pair with the CSI driver to deliver short-lived
+     certs to workload pods without restart.
+   - **[HashiCorp Vault PKI](https://developer.hashicorp.com/vault/docs/secrets/pki)**
+     -- set `max_ttl` on the role to `24h` and have clients re-issue
+     via `vault write pki/issue/<role>` on a cron / sidecar.
+   - **[Smallstep `step-ca`](https://smallstep.com/docs/step-ca/)** --
+     configure provisioner `claims.maxTLSCertDuration: 24h`; use
+     `step ca renew --daemon` for hands-off rotation.
+
+2. **CA rotation on compromise.** If a long-lived cert leaks, rotate
+   the issuing CA and update `mtls.ca_cert_path` in your mcpx config.
+   Use `ReloadHandle::reload_*` (see `transport::ReloadHandle`) for a
+   zero-downtime swap.
+
+3. **Network-layer revocation.** Block compromised client identities at
+   the load balancer, service mesh (Istio/Linkerd `AuthorizationPolicy`),
+   or WAF. This is the only mechanism with sub-second propagation.
+
+If your environment cannot meet any of the above, prefer the Bearer or
+OAuth 2.1 JWT auth methods, which support immediate revocation via the
+RFC 7009 revocation endpoint (`oauth.revocation_endpoint`) or by
+deleting the API key entry and calling `ReloadHandle::reload_auth_keys`.
+
 #### `build_rate_limiter()`
 
 ```rust
