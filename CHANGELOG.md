@@ -8,6 +8,8 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-04-19
+
 ### Changed
 
 - **[H-A4] Tool hooks are now `async`.** `BeforeHook` and `AfterHook`
