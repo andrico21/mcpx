@@ -53,3 +53,7 @@ pub mod oauth;
 #[cfg(feature = "metrics")]
 /// Prometheus metrics registry shared across server components.
 pub mod metrics;
+
+// Re-export the canonical error types at the crate root for ergonomic
+// `mcpx::Result<()>` / `mcpx::McpxError` usage in downstream crates.
+pub use crate::error::{McpxError, Result};

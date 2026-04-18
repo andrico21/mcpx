@@ -34,7 +34,7 @@ impl ServerHandler for MinimalHandler {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> mcpx::Result<()> {
     // Ignore the error: the only failure mode is "a global tracing
     // subscriber was already installed", which is harmless for an example
     // that owns the entire process.

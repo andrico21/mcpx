@@ -39,9 +39,18 @@ pub enum McpxError {
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),
 
-    /// Any other error, opaquely wrapped via [`anyhow`].
-    #[error("{0}")]
-    Other(#[from] anyhow::Error),
+    /// TLS configuration failure (certificate load, key parse, rustls config).
+    #[error("TLS error: {0}")]
+    Tls(String),
+
+    /// Server startup failure (binding, listener, runtime initialization).
+    #[error("server startup error: {0}")]
+    Startup(String),
+
+    /// Metrics registration failure (e.g. Prometheus duplicate or invalid metric).
+    #[cfg(feature = "metrics")]
+    #[error("metrics error: {0}")]
+    Metrics(String),
 }
 
 impl IntoResponse for McpxError {
@@ -56,7 +65,16 @@ impl IntoResponse for McpxError {
             | Self::Io(_)
             | Self::Json(_)
             | Self::Toml(_)
-            | Self::Other(_)) => {
+            | Self::Tls(_)
+            | Self::Startup(_)) => {
+                tracing::error!(error = %other, "internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".into(),
+                )
+            }
+            #[cfg(feature = "metrics")]
+            other @ Self::Metrics(_) => {
                 tracing::error!(error = %other, "internal error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -120,6 +138,37 @@ mod tests {
     async fn io_error_returns_500() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
         let (status, body) = status_of(McpxError::from(io_err)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body, "internal server error",
+            "must not leak internal detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_error_returns_500() {
+        let (status, body) = status_of(McpxError::Tls("bad cert".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body, "internal server error",
+            "must not leak internal detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_error_returns_500() {
+        let (status, body) = status_of(McpxError::Startup("bind failed".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body, "internal server error",
+            "must not leak internal detail"
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn metrics_error_returns_500() {
+        let (status, body) = status_of(McpxError::Metrics("dup metric".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",

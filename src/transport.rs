@@ -23,8 +23,33 @@ use crate::{
         AuthConfig, AuthIdentity, AuthState, MtlsConfig, TlsConnInfo, auth_middleware,
         build_rate_limiter, extract_mtls_identity,
     },
+    error::McpxError,
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter, rbac_middleware},
 };
+
+/// Map an internal `anyhow::Error` chain into a public [`McpxError::Startup`]
+/// at the public API boundary, flattening the chain via the alternate
+/// formatter so callers see the full causal path.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "consumed at .map_err(anyhow_to_startup) call sites; by-value matches the closure shape"
+)]
+fn anyhow_to_startup(e: anyhow::Error) -> McpxError {
+    McpxError::Startup(format!("{e:#}"))
+}
+
+/// Map a `std::io::Error` produced during server startup into a public
+/// [`McpxError::Startup`]. We deliberately do not use the [`McpxError::Io`]
+/// `From` impl here because startup-phase IO errors (bind, listener) are
+/// semantically distinct from request-time IO errors and should surface
+/// the originating operation in the message.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "consumed at .map_err(|e| io_to_startup(...)) call sites; by-value matches the closure shape"
+)]
+fn io_to_startup(op: &str, e: std::io::Error) -> McpxError {
+    McpxError::Startup(format!("{op}: {e}"))
+}
 
 /// Async readiness check callback for the `/readyz` endpoint.
 ///
@@ -643,8 +668,7 @@ where
     #[cfg(feature = "metrics")]
     if config.metrics_enabled {
         let metrics = Arc::new(
-            crate::metrics::McpMetrics::new()
-                .map_err(|e| std::io::Error::other(format!("metrics init: {e}")))?,
+            crate::metrics::McpMetrics::new().map_err(|e| anyhow::anyhow!("metrics init: {e}"))?,
         );
         let m = Arc::clone(&metrics);
         router = router.layer(axum::middleware::from_fn(
@@ -710,18 +734,20 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`anyhow::Error`] if router construction fails (invalid
+/// Returns [`McpxError::Startup`] if router construction fails (invalid
 /// auth/admin/OAuth configuration), if binding to `config.bind_addr`
 /// fails, or if the underlying axum server returns an error.
-pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> anyhow::Result<()>
+pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> Result<(), McpxError>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
     let bind_addr = config.bind_addr.clone();
-    let (router, params) = build_app_router(config, handler_factory)?;
+    let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
 
-    let listener = TcpListener::bind(&bind_addr).await?;
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| io_to_startup(&format!("bind {bind_addr}"), e))?;
     log_listening(&params.name, params.scheme, &bind_addr);
 
     run_server(
@@ -733,6 +759,7 @@ where
         params.ct,
     )
     .await
+    .map_err(anyhow_to_startup)
 }
 
 /// Run the MCP HTTP server on a pre-bound [`TcpListener`], with optional
@@ -761,7 +788,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`anyhow::Error`] if router construction fails, if reading
+/// Returns [`McpxError::Startup`] if router construction fails, if reading
 /// the listener's `local_addr()` fails, or if the underlying axum
 /// server returns an error.
 pub async fn serve_with_listener<H, F>(
@@ -770,13 +797,15 @@ pub async fn serve_with_listener<H, F>(
     handler_factory: F,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
     shutdown: Option<CancellationToken>,
-) -> anyhow::Result<()>
+) -> Result<(), McpxError>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
-    let local_addr = listener.local_addr()?;
-    let (router, params) = build_app_router(config, handler_factory)?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| io_to_startup("listener.local_addr", e))?;
+    let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
 
     log_listening(&params.name, params.scheme, &local_addr.to_string());
 
@@ -808,6 +837,7 @@ where
         params.ct,
     )
     .await
+    .map_err(anyhow_to_startup)
 }
 
 /// Emit the standard "listening on …" log lines used by both
@@ -1558,13 +1588,13 @@ fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error if the handler fails to initialize or the transport
-/// disconnects unexpectedly.
+/// Returns [`McpxError::Startup`] if the handler fails to initialize or the
+/// transport disconnects unexpectedly.
 // NOTE: reported complexity 32/25 is driven entirely by `tracing::*!`
 // macro expansion in this 18-line function (info/warn/info + two matches).
 // There is nothing meaningful to extract; the allow stays.
 #[allow(clippy::cognitive_complexity)]
-pub async fn serve_stdio<H>(handler: H) -> anyhow::Result<()>
+pub async fn serve_stdio<H>(handler: H) -> Result<(), McpxError>
 where
     H: ServerHandler + 'static,
 {
@@ -1578,7 +1608,7 @@ where
     let service = handler
         .serve(transport)
         .await
-        .map_err(|e| anyhow::anyhow!("stdio initialize failed: {e}"))?;
+        .map_err(|e| McpxError::Startup(format!("stdio initialize failed: {e}")))?;
 
     if let Err(e) = service.waiting().await {
         tracing::warn!(error = %e, "stdio session ended with error");

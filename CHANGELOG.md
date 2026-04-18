@@ -8,6 +8,27 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **[H-A1] Public API no longer leaks `anyhow`.** `serve()`,
+  `serve_with_listener()`, `serve_stdio()`, `serve_metrics()`, and
+  `McpMetrics::new()` now return `Result<_, McpxError>` instead of
+  `anyhow::Result<_>` / `prometheus::Result<_>`. New `McpxError`
+  variants `Tls(String)`, `Startup(String)`, and (under
+  `feature = "metrics"`) `Metrics(String)` carry the wrapped detail.
+  The opaque `McpxError::Other(anyhow::Error)` variant has been
+  **removed**. Most call sites that propagate via `?` into
+  `anyhow::Result<()>` will keep compiling because `McpxError` impls
+  `std::error::Error`. Call sites that name the return type
+  explicitly must switch to `mcpx::Result<()>` (newly re-exported at
+  the crate root). See `examples/minimal_server.rs` for the
+  recommended pattern.
+
+### Added
+
+- `mcpx::McpxError` and `mcpx::Result` re-exports at the crate root
+  for ergonomic downstream usage.
+
 ## [0.11.0] - 2026-04-18
 
 Operational hardening release. Closes the nine high-priority items from

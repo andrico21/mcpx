@@ -3,12 +3,22 @@
 //! Provides a shared [`crate::metrics::McpMetrics`] registry with standard HTTP counters.
 //! The transport layer exposes these via a `/metrics` endpoint on a
 //! dedicated listener when `metrics_enabled` is true.
+//!
+//! # Public surface and the `prometheus` crate
+//!
+//! [`crate::metrics::McpMetrics::registry`] and the `IntCounterVec` / `HistogramVec` fields are
+//! intentionally exposed so downstream crates can register additional custom
+//! collectors against the same registry. This re-exports the [`prometheus`]
+//! crate types as part of `mcpx`'s public API; pin the same major version to
+//! avoid type-identity mismatches when registering custom metrics.
 
 use std::sync::Arc;
 
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, Registry, TextEncoder, histogram_opts, opts,
 };
+
+use crate::error::McpxError;
 
 /// Collected Prometheus metrics for an MCP server.
 #[derive(Clone, Debug)]
@@ -27,16 +37,19 @@ impl McpMetrics {
     ///
     /// # Errors
     ///
-    /// Returns an error if counter registration fails (should not happen
-    /// unless duplicate registrations occur).
-    pub fn new() -> prometheus::Result<Self> {
+    /// Returns [`McpxError::Metrics`] if counter registration fails (should
+    /// not happen unless duplicate registrations occur).
+    pub fn new() -> Result<Self, McpxError> {
         let registry = Registry::new();
 
         let http_requests_total = IntCounterVec::new(
             opts!("mcpx_http_requests_total", "Total HTTP requests"),
             &["method", "path", "status"],
-        )?;
-        registry.register(Box::new(http_requests_total.clone()))?;
+        )
+        .map_err(|e| McpxError::Metrics(e.to_string()))?;
+        registry
+            .register(Box::new(http_requests_total.clone()))
+            .map_err(|e| McpxError::Metrics(e.to_string()))?;
 
         let http_request_duration_seconds = HistogramVec::new(
             histogram_opts!(
@@ -44,8 +57,11 @@ impl McpMetrics {
                 "HTTP request duration in seconds"
             ),
             &["method", "path"],
-        )?;
-        registry.register(Box::new(http_request_duration_seconds.clone()))?;
+        )
+        .map_err(|e| McpxError::Metrics(e.to_string()))?;
+        registry
+            .register(Box::new(http_request_duration_seconds.clone()))
+            .map_err(|e| McpxError::Metrics(e.to_string()))?;
 
         Ok(Self {
             registry,
@@ -74,8 +90,9 @@ impl McpMetrics {
 ///
 /// # Errors
 ///
-/// Returns an error if the TCP listener cannot bind or the server fails.
-pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> anyhow::Result<()> {
+/// Returns [`McpxError::Startup`] if the TCP listener cannot bind or the
+/// underlying axum server fails.
+pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> Result<(), McpxError> {
     let app = axum::Router::new().route(
         "/metrics",
         axum::routing::get(move || {
@@ -84,9 +101,13 @@ pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> anyhow::Re
         }),
     );
 
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .map_err(|e| McpxError::Startup(format!("metrics bind {bind}: {e}")))?;
     tracing::info!("metrics endpoint listening on http://{bind}/metrics");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| McpxError::Startup(format!("metrics serve: {e}")))?;
     Ok(())
 }
 

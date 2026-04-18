@@ -64,7 +64,7 @@ struct ServerHarness {
     shutdown: CancellationToken,
     /// Join handle for the server task. `None` after [`Self::shutdown`]
     /// joins it.
-    join: Option<JoinHandle<anyhow::Result<()>>>,
+    join: Option<JoinHandle<mcpx::Result<()>>>,
 }
 
 #[allow(
@@ -78,7 +78,10 @@ impl ServerHarness {
     async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.shutdown.cancel();
         match self.join.take() {
-            Some(h) => h.await.unwrap_or_else(|e| Err(e.into())),
+            Some(h) => match h.await {
+                Ok(server_res) => server_res.map_err(anyhow::Error::from),
+                Err(join_err) => Err(join_err.into()),
+            },
             None => Ok(()),
         }
     }
