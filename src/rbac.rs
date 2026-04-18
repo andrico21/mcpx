@@ -19,6 +19,7 @@ use axum::{
 };
 use governor::{RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use http_body_util::BodyExt;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use crate::{
@@ -43,10 +44,14 @@ pub fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter> {
 
 // Task-local storage for the current caller's RBAC role and identity name.
 // Set by the RBAC middleware, read by tool handlers (e.g. list_hosts filtering, audit logging).
+//
+// `CURRENT_TOKEN` holds a [`SecretString`] so the raw bearer token is never
+// printed via `Debug` (it formats as `"[REDACTED alloc::string::String]"`)
+// and is zeroized on drop by the `secrecy` crate.
 tokio::task_local! {
     static CURRENT_ROLE: String;
     static CURRENT_IDENTITY: String;
-    static CURRENT_TOKEN: String;
+    static CURRENT_TOKEN: SecretString;
     static CURRENT_SUB: String;
 }
 
@@ -64,15 +69,30 @@ pub fn current_identity() -> Option<String> {
     CURRENT_IDENTITY.try_with(Clone::clone).ok()
 }
 
-/// Get the raw bearer token for the current request (set by RBAC middleware).
+/// Get the raw bearer token for the current request as a [`SecretString`].
 /// Returns `None` outside a request context or when auth used mTLS/API-key.
 /// Tool handlers use this for downstream token passthrough.
+///
+/// The returned value is wrapped in [`SecretString`] so it does not leak
+/// via `Debug`/`Display`/serde. Call `.expose_secret()` only when the
+/// raw value is actually needed (e.g. as the `Authorization` header on
+/// an outbound HTTP request).
+///
+/// An empty token is treated as absent (returns `None`); this preserves
+/// backward compatibility with the prior `Option<String>` API where the
+/// empty default sentinel meant "no token".
 #[must_use]
-pub fn current_token() -> Option<String> {
+pub fn current_token() -> Option<SecretString> {
     CURRENT_TOKEN
-        .try_with(Clone::clone)
+        .try_with(|t| {
+            if t.expose_secret().is_empty() {
+                None
+            } else {
+                Some(t.clone())
+            }
+        })
         .ok()
-        .filter(|t| !t.is_empty())
+        .flatten()
 }
 
 /// Get the JWT `sub` claim (stable user ID, e.g. Keycloak UUID).
@@ -90,7 +110,7 @@ pub fn current_sub() -> Option<String> {
 /// the given value inside the future. Useful when MCP tool handlers need the
 /// raw bearer token but run in a spawned task where the RBAC middleware's
 /// task-local scope is no longer active.
-pub async fn with_token_scope<F: Future>(token: String, f: F) -> F::Output {
+pub async fn with_token_scope<F: Future>(token: SecretString, f: F) -> F::Output {
     CURRENT_TOKEN.scope(token, f).await
 }
 
@@ -101,7 +121,7 @@ pub async fn with_token_scope<F: Future>(token: String, f: F) -> F::Output {
 pub async fn with_rbac_scope<F: Future>(
     role: String,
     identity: String,
-    token: String,
+    token: SecretString,
     sub: String,
     f: F,
 ) -> F::Output {
@@ -475,9 +495,11 @@ pub async fn rbac_middleware(
     let identity = req.extensions().get::<AuthIdentity>();
     let identity_name = identity.map(|id| id.name.clone()).unwrap_or_default();
     let role = identity.map(|id| id.role.clone()).unwrap_or_default();
-    let raw_token = identity
+    // Clone the SecretString end-to-end; an absent token becomes an empty
+    // SecretString sentinel (current_token() filters this out as None).
+    let raw_token: SecretString = identity
         .and_then(|id| id.raw_token.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| SecretString::from(String::new()));
     let sub = identity.and_then(|id| id.sub.clone()).unwrap_or_default();
 
     // RBAC requires an authenticated identity.

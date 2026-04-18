@@ -28,6 +28,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use governor::{RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
+use secrecy::SecretString;
 use serde::Deserialize;
 use x509_parser::prelude::*;
 
@@ -43,10 +44,12 @@ pub struct AuthIdentity {
     pub role: String,
     /// Which authentication mechanism produced this identity.
     pub method: AuthMethod,
-    /// Raw bearer token from the `Authorization` header.
+    /// Raw bearer token from the `Authorization` header, wrapped in
+    /// [`SecretString`] so it is never accidentally logged or serialized.
     /// Present for OAuth JWT; `None` for mTLS and API-key auth.
-    /// Tool handlers use this for downstream token passthrough.
-    pub raw_token: Option<String>,
+    /// Tool handlers use this for downstream token passthrough via
+    /// [`crate::rbac::current_token`].
+    pub raw_token: Option<SecretString>,
     /// JWT `sub` claim (stable user identifier, e.g. Keycloak UUID).
     /// Used for token store keying. `None` for non-JWT auth.
     pub sub: Option<String>,
@@ -639,7 +642,7 @@ async fn authenticate_bearer_identity(
     {
         match cache.validate_token_with_reason(token).await {
             Ok(mut id) => {
-                id.raw_token = Some(token.to_owned());
+                id.raw_token = Some(SecretString::from(token.to_owned()));
                 return Ok(id);
             }
             Err(crate::oauth::JwtValidationFailure::Expired) => {

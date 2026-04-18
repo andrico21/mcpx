@@ -246,8 +246,10 @@ Generic wrapper around a consumer's `ServerHandler` that runs:
 3. On success, builds `AuthIdentity { method: ApiKey, role: entry.role, … }`.
 4. On too many failures from one IP, the auth rate limiter returns `429`.
 
-API keys are never logged. They are wrapped in `secrecy::Secret<String>`
-and zeroized on drop.
+API keys are never logged. They are wrapped in `secrecy::SecretString`
+and zeroized on drop. Bearer tokens accepted as OAuth JWTs are likewise
+threaded as `SecretString` from `AuthIdentity.raw_token` through
+`CURRENT_TOKEN` so that they never appear in `Debug` output.
 
 ### mTLS flow
 1. The `TlsListener` validates the client cert chain (configured roots).
@@ -307,13 +309,18 @@ ArgumentAllowlist {                       // src/rbac.rs:166
 ### Task-locals
 `tokio::task_local!` block at `src/rbac.rs:46-51` defines four task-locals:
 - `CURRENT_ROLE: String`
-- `CURRENT_IDENTITY: AuthIdentity`
-- `CURRENT_TOKEN: Secret<String>`
+- `CURRENT_IDENTITY: String`
+- `CURRENT_TOKEN: SecretString`
 - `CURRENT_SUB: String`
 
-Public accessors (`src/rbac.rs:53-75`): `current_role()`, `current_identity()`,
+Public accessors (`src/rbac.rs:53-87`): `current_role()`, `current_identity()`,
 `current_token()`, `current_sub()`. They return `Option<T>` because the
 task-locals are absent outside the request scope.
+
+`current_token()` returns `Option<SecretString>` (since 0.11). Call
+`.expose_secret()` only when the raw value is genuinely required — e.g.
+when constructing an outbound `Authorization` header for downstream
+token passthrough.
 
 > ⚠️ **These do NOT propagate across `tokio::spawn`.** Capture the value
 > before spawning a child task.
@@ -594,9 +601,9 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 7. **`stdio` transport bypasses ALL middleware** (auth, RBAC, TLS, origin).
    Document this loudly to consumers and never recommend it for network use.
 
-8. **Secrets must use `secrecy::Secret<T>`.** Logging or `Debug`-printing
-   the wrapped value yields `[REDACTED]`. Calling `.expose_secret()` and
-   then logging the result re-leaks. Don't.
+8. **Secrets must use `secrecy::SecretString` (or `SecretBox<T>`).**
+   Logging or `Debug`-printing the wrapped value yields `[REDACTED]`.
+   Calling `.expose_secret()` and then logging the result re-leaks. Don't.
 
 9. **No panics in production code paths.** `unwrap_used = "deny"`,
    `panic = "deny"`, `todo = "deny"`, `unimplemented = "deny"` are set
