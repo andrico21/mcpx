@@ -81,6 +81,7 @@ arc-swap = "1"
 
 # Utilities
 humantime = "2"
+humantime-serde = "1"
 secrecy = { version = "0.10", features = ["serde"] }
 
 # Metrics (optional)
@@ -102,6 +103,7 @@ rsa = "0.9"
 wiremock = "0.6"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+memory-stats = "1"
 
 
 # ──────────────────────────────────────────────────────────────────────────

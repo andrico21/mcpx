@@ -15,6 +15,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use arc_swap::ArcSwap;
@@ -27,12 +28,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use governor::{RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use secrecy::SecretString;
 use serde::Deserialize;
 use x509_parser::prelude::*;
 
-use crate::error::McpxError;
+use crate::{bounded_limiter::BoundedKeyedLimiter, error::McpxError};
 
 /// Identity of an authenticated caller.
 #[derive(Debug, Clone)]
@@ -289,16 +289,38 @@ pub struct RateLimitConfig {
     /// to bound CPU usage under spray attacks.
     #[serde(default)]
     pub pre_auth_max_per_minute: Option<u32>,
+    /// Hard cap on the number of distinct source IPs tracked per limiter.
+    /// When reached, idle entries are pruned first; if still full, the
+    /// oldest (LRU) entry is evicted to make room for the new one. This
+    /// bounds memory under IP-spray attacks. Default: `10_000`.
+    #[serde(default = "default_max_tracked_keys")]
+    pub max_tracked_keys: usize,
+    /// Per-IP entries idle for longer than this are eligible for
+    /// opportunistic pruning. Default: 15 minutes.
+    #[serde(default = "default_idle_eviction", with = "humantime_serde")]
+    pub idle_eviction: Duration,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts_per_minute: default_max_attempts(),
+            pre_auth_max_per_minute: None,
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
+        }
+    }
 }
 
 impl RateLimitConfig {
     /// Create a rate limit config with the given max failed attempts per minute.
     /// Pre-auth gate defaults to `10x` this value at limiter-construction time.
+    /// Memory-bound defaults are `10_000` tracked keys with 15-minute idle eviction.
     #[must_use]
     pub fn new(max_attempts_per_minute: u32) -> Self {
         Self {
             max_attempts_per_minute,
-            pre_auth_max_per_minute: None,
+            ..Self::default()
         }
     }
 
@@ -309,10 +331,32 @@ impl RateLimitConfig {
         self.pre_auth_max_per_minute = Some(quota);
         self
     }
+
+    /// Override the per-limiter cap on tracked source-IP keys (default `10_000`).
+    #[must_use]
+    pub fn with_max_tracked_keys(mut self, max: usize) -> Self {
+        self.max_tracked_keys = max;
+        self
+    }
+
+    /// Override the idle-eviction window (default 15 minutes).
+    #[must_use]
+    pub fn with_idle_eviction(mut self, idle: Duration) -> Self {
+        self.idle_eviction = idle;
+        self
+    }
 }
 
 fn default_max_attempts() -> u32 {
     30
+}
+
+fn default_max_tracked_keys() -> usize {
+    10_000
+}
+
+fn default_idle_eviction() -> Duration {
+    Duration::from_mins(15)
 }
 
 /// Authentication configuration.
@@ -415,8 +459,9 @@ impl AuthConfig {
     }
 }
 
-/// Keyed rate limiter type (per source IP).
-type KeyedLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+/// Keyed rate limiter type (per source IP). Memory-bounded by
+/// [`RateLimitConfig::max_tracked_keys`] to defend against IP-spray `DoS`.
+pub type KeyedLimiter = BoundedKeyedLimiter<IpAddr>;
 
 /// Connection info for TLS connections, carrying the peer socket address
 /// and (when mTLS is configured) the verified client identity extracted
@@ -530,7 +575,11 @@ pub fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
     let quota = governor::Quota::per_minute(
         NonZeroU32::new(config.max_attempts_per_minute).unwrap_or(DEFAULT_AUTH_RATE),
     );
-    Arc::new(RateLimiter::keyed(quota))
+    Arc::new(BoundedKeyedLimiter::new(
+        quota,
+        config.max_tracked_keys,
+        config.idle_eviction,
+    ))
 }
 
 /// Create a pre-auth abuse-gate rate limiter from config.
@@ -548,7 +597,11 @@ pub fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
     });
     let quota =
         governor::Quota::per_minute(NonZeroU32::new(resolved).unwrap_or(DEFAULT_PRE_AUTH_RATE));
-    Arc::new(RateLimiter::keyed(quota))
+    Arc::new(BoundedKeyedLimiter::new(
+        quota,
+        config.max_tracked_keys,
+        config.idle_eviction,
+    ))
 }
 
 /// Default multiplier applied to `max_attempts_per_minute` when the operator
@@ -948,6 +1001,7 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 5,
             pre_auth_max_per_minute: None,
+            ..Default::default()
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -965,6 +1019,7 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 2,
             pre_auth_max_per_minute: None,
+            ..Default::default()
         };
         let limiter = build_rate_limiter(&config);
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1134,6 +1189,7 @@ mod tests {
             rate_limiter: Some(build_rate_limiter(&RateLimitConfig {
                 max_attempts_per_minute: 1,
                 pre_auth_max_per_minute: None,
+                ..Default::default()
             })),
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
@@ -1168,6 +1224,7 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 3,
             pre_auth_max_per_minute: None,
+            ..Default::default()
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -1209,6 +1266,7 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 5,
             pre_auth_max_per_minute: None,
+            ..Default::default()
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1234,6 +1292,7 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,     // would default to 1000 pre-auth quota
             pre_auth_max_per_minute: Some(2), // but operator caps at 2
+            ..Default::default()
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
@@ -1263,6 +1322,7 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,
             pre_auth_max_per_minute: Some(1),
+            ..Default::default()
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(keys)),
@@ -1333,6 +1393,7 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,
             pre_auth_max_per_minute: Some(1), // tight: would block 2nd plain request
+            ..Default::default()
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),

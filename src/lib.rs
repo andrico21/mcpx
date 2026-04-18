@@ -34,6 +34,9 @@ pub mod auth;
 /// Role-based access control policy engine and middleware.
 pub mod rbac;
 
+/// Memory-bounded keyed rate limiter (LRU + idle eviction).
+pub mod bounded_limiter;
+
 /// Admin diagnostic endpoints (status, auth keys metadata, counters, RBAC).
 pub mod admin;
 

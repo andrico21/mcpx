@@ -8,7 +8,7 @@
 //! and enforces RBAC and per-IP tool rate limiting before the request
 //! reaches the handler.
 
-use std::{net::IpAddr, num::NonZeroU32, sync::Arc};
+use std::{net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -17,7 +17,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use governor::{RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use secrecy::{ExposeSecret, SecretString};
@@ -26,22 +25,53 @@ use sha2::Sha256;
 
 use crate::{
     auth::{AuthIdentity, TlsConnInfo},
+    bounded_limiter::BoundedKeyedLimiter,
     error::McpxError,
 };
 
-/// Per-source-IP rate limiter for tool invocations.
-pub type ToolRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+/// Per-source-IP rate limiter for tool invocations. Memory-bounded against
+/// IP-spray `DoS` via [`BoundedKeyedLimiter`].
+pub type ToolRateLimiter = BoundedKeyedLimiter<IpAddr>;
 
 /// Default tool rate limit: 120 invocations per minute per source IP.
 // SAFETY: unwrap() is safe - literal 120 is provably non-zero (const-evaluated).
 const DEFAULT_TOOL_RATE: NonZeroU32 = NonZeroU32::new(120).unwrap();
 
+/// Default cap on the number of distinct source IPs tracked by the tool
+/// rate limiter. Bounded to defend against IP-spray `DoS` exhausting memory.
+const DEFAULT_TOOL_MAX_TRACKED_KEYS: usize = 10_000;
+
+/// Default idle-eviction window for the tool rate limiter (15 minutes).
+const DEFAULT_TOOL_IDLE_EVICTION: Duration = Duration::from_mins(15);
+
 /// Build a per-IP tool rate limiter from a max-calls-per-minute value.
+///
+/// Memory-bounded with [`DEFAULT_TOOL_MAX_TRACKED_KEYS`] tracked keys and
+/// [`DEFAULT_TOOL_IDLE_EVICTION`] idle eviction. Use
+/// [`build_tool_rate_limiter_with_bounds`] to override.
 #[must_use]
 pub fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter> {
+    build_tool_rate_limiter_with_bounds(
+        max_per_minute,
+        DEFAULT_TOOL_MAX_TRACKED_KEYS,
+        DEFAULT_TOOL_IDLE_EVICTION,
+    )
+}
+
+/// Build a per-IP tool rate limiter with explicit memory-bound parameters.
+#[must_use]
+pub fn build_tool_rate_limiter_with_bounds(
+    max_per_minute: u32,
+    max_tracked_keys: usize,
+    idle_eviction: Duration,
+) -> Arc<ToolRateLimiter> {
     let quota =
         governor::Quota::per_minute(NonZeroU32::new(max_per_minute).unwrap_or(DEFAULT_TOOL_RATE));
-    Arc::new(RateLimiter::keyed(quota))
+    Arc::new(BoundedKeyedLimiter::new(
+        quota,
+        max_tracked_keys,
+        idle_eviction,
+    ))
 }
 
 // Task-local storage for the current caller's RBAC role and identity name.
@@ -1429,7 +1459,7 @@ mod tests {
         let _ = redact_with_salt(salt, &value);
         let elapsed = start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(5),
+            elapsed < Duration::from_millis(5),
             "single redact_with_salt took {elapsed:?}, expected <5 ms even in debug"
         );
     }
