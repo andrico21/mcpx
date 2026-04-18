@@ -18,7 +18,7 @@ handles everything else.
 
 ```toml
 [dependencies]
-mcpx = { version = "0.9", features = ["oauth"] }
+mcpx = { version = "0.10", features = ["oauth"] }
 rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```

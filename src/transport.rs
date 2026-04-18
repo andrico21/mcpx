@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     auth::{
-        AuthConfig, AuthState, MtlsConfig, MtlsIdentities, TlsConnInfo, auth_middleware,
+        AuthConfig, AuthIdentity, AuthState, MtlsConfig, TlsConnInfo, auth_middleware,
         build_rate_limiter, extract_mtls_identity,
     },
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter, rbac_middleware},
@@ -240,10 +240,6 @@ where
             .with_cancellation_token(ct.child_token()),
     );
 
-    // Shared mTLS identity map - populated by TLS acceptor, read by auth middleware.
-    let mtls_identities: MtlsIdentities =
-        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-
     // Build the MCP route, optionally wrapped with auth and RBAC middleware.
     let mut mcp_router = axum::Router::new().nest_service("/mcp", mcp_service);
 
@@ -264,7 +260,6 @@ where
 
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
-                mtls_identities: Arc::clone(&mtls_identities),
                 rate_limiter,
                 #[cfg(feature = "oauth")]
                 jwks_cache,
@@ -306,18 +301,36 @@ where
         tracing::info!(role = %config.admin_role, "/admin/* endpoints enabled");
     }
 
-    // Request body size limit (prevents OOM from oversized payloads).
-    mcp_router = mcp_router.layer(tower_http::limit::RequestBodyLimitLayer::new(
-        config.max_request_body,
-    ));
+    // ----- Middleware order (CRITICAL: read carefully) ------------------
+    //
+    // axum/tower applies layers **bottom-up** at runtime: the LAST layer
+    // added is the OUTERMOST (runs first on a request). To achieve a
+    // request-time flow of:
+    //
+    //   body-limit -> timeout -> auth -> rbac -> handler
+    //
+    // we add layers in the REVERSE order:
+    //
+    //   1. RBAC               (innermost, runs last before handler)
+    //   2. auth               (parses identity, sets extension for RBAC)
+    //   3. timeout            (bounds total request time)
+    //   4. body-limit         (outermost on /mcp; caps payload before
+    //                          anything else reads/buffers it)
+    //
+    // Origin validation is installed on the OUTER router (after the
+    // /mcp router is merged in), so it also protects /healthz, /readyz,
+    // /version, and any OAuth proxy endpoints.
+    //
+    // Rationale:
+    // - Body-limit must be outermost on /mcp so RBAC (which reads the
+    //   JSON-RPC body) cannot be DoS'd by a 100MB payload.
+    // - Auth must run before RBAC because RBAC consumes
+    //   `req.extensions().get::<AuthIdentity>()` to enforce per-role
+    //   policy.
+    // - Origin runs before auth so we reject cross-origin requests
+    //   without spending Argon2 cycles on unauthenticated callers.
 
-    // Request timeout (returns 408 on expiry).
-    mcp_router = mcp_router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
-        axum::http::StatusCode::REQUEST_TIMEOUT,
-        config.request_timeout,
-    ));
-
-    // RBAC + tool rate-limit layer (closest to handler, enforced after auth).
+    // [1] RBAC + tool rate-limit layer (innermost; closest to handler).
     // Always installed: even when RBAC is disabled, tool rate limiting may
     // be active (MCP spec: servers MUST rate limit tool invocations).
     {
@@ -339,38 +352,7 @@ where
         }));
     }
 
-    // Origin validation layer (MCP spec: servers MUST validate the Origin
-    // header to prevent DNS rebinding attacks). Applied as outermost layer
-    // so it runs before auth/RBAC.
-    //
-    // When `allowed_origins` is empty but `public_url` is set, auto-derive
-    // the origin from the public URL so that MCP clients (e.g. Claude Code)
-    // that send `Origin: <server-url>` are accepted without explicit config.
-    let mut effective_origins = config.allowed_origins.clone();
-    if effective_origins.is_empty()
-        && let Some(ref url) = config.public_url
-    {
-        // Origin = scheme + "://" + host (+ ":" + port if non-default).
-        // Strip any path/query from the public URL.
-        if let Some(scheme_end) = url.find("://") {
-            let after_scheme = &url[scheme_end + 3..];
-            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-            let origin = format!("{}{}", &url[..scheme_end + 3], &after_scheme[..host_end]);
-            tracing::info!(
-                %origin,
-                "auto-derived allowed origin from public_url"
-            );
-            effective_origins.push(origin);
-        }
-    }
-    let allowed_origins: Arc<[String]> = Arc::from(effective_origins);
-    let cors_origins = Arc::clone(&allowed_origins);
-    let log_request_headers = config.log_request_headers;
-    mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
-        let origins = Arc::clone(&allowed_origins);
-        origin_check_middleware(origins, log_request_headers, req, next)
-    }));
-
+    // [2] Auth layer (runs before RBAC so AuthIdentity is in extensions).
     if let Some(ref auth_config) = config.auth
         && auth_config.enabled
     {
@@ -414,6 +396,47 @@ where
             rbac: Some(Arc::clone(&rbac_swap)),
         });
     }
+
+    // [3] Request timeout (returns 408 on expiry). Bounds total request
+    // duration including auth + handler.
+    mcp_router = mcp_router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        config.request_timeout,
+    ));
+
+    // [4] Request body size limit (OUTERMOST on /mcp). Prevents OOM /
+    // DoS from oversized payloads BEFORE any inner layer (auth, RBAC)
+    // attempts to buffer or parse the body.
+    mcp_router = mcp_router.layer(tower_http::limit::RequestBodyLimitLayer::new(
+        config.max_request_body,
+    ));
+
+    // Compute the effective allowed-origins list for the outer
+    // origin-check layer (installed on the merged router below). When
+    // `allowed_origins` is empty but `public_url` is set, auto-derive
+    // the origin from the public URL so MCP clients (e.g. Claude Code)
+    // that send `Origin: <server-url>` are accepted without explicit
+    // config.
+    let mut effective_origins = config.allowed_origins.clone();
+    if effective_origins.is_empty()
+        && let Some(ref url) = config.public_url
+    {
+        // Origin = scheme + "://" + host (+ ":" + port if non-default).
+        // Strip any path/query from the public URL.
+        if let Some(scheme_end) = url.find("://") {
+            let after_scheme = &url[scheme_end + 3..];
+            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+            let origin = format!("{}{}", &url[..scheme_end + 3], &after_scheme[..host_end]);
+            tracing::info!(
+                %origin,
+                "auto-derived allowed origin from public_url"
+            );
+            effective_origins.push(origin);
+        }
+    }
+    let allowed_origins: Arc<[String]> = Arc::from(effective_origins);
+    let cors_origins = Arc::clone(&allowed_origins);
+    let log_request_headers = config.log_request_headers;
 
     let readyz_route = if let Some(check) = config.readiness_check.take() {
         axum::routing::get(move || readyz(Arc::clone(&check)))
@@ -597,6 +620,21 @@ where
         });
     }
 
+    // Origin validation layer (MCP spec: servers MUST validate the
+    // Origin header to prevent DNS rebinding attacks). Installed as the
+    // OUTERMOST layer on the OUTER router so it protects ALL routes
+    // (`/mcp`, `/healthz`, `/readyz`, `/version`, OAuth proxy endpoints,
+    // admin endpoints, extra_router, etc.) and runs BEFORE auth so we
+    // reject cross-origin attackers without spending Argon2 cycles.
+    //
+    // Origin-less requests (e.g. server-to-server probes, curl, native
+    // MCP clients) are permitted; only requests with an Origin header
+    // that does not match `effective_origins` are rejected.
+    router = router.layer(axum::middleware::from_fn(move |req, next| {
+        let origins = Arc::clone(&allowed_origins);
+        origin_check_middleware(origins, log_request_headers, req, next)
+    }));
+
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let scheme = if config.tls_cert_path.is_some() {
         "https"
@@ -621,7 +659,6 @@ where
         mtls_config,
         config.shutdown_timeout,
         ct,
-        mtls_identities,
     )
     .await
 }
@@ -635,7 +672,6 @@ async fn run_server(
     mtls_config: Option<MtlsConfig>,
     shutdown_timeout: Duration,
     ct: CancellationToken,
-    mtls_identities: MtlsIdentities,
 ) -> anyhow::Result<()> {
     let shutdown = async move {
         shutdown_signal().await;
@@ -644,13 +680,7 @@ async fn run_server(
     };
 
     if let Some((cert_path, key_path)) = tls_paths {
-        let tls_listener = TlsListener::new(
-            listener,
-            &cert_path,
-            &key_path,
-            mtls_config.as_ref(),
-            mtls_identities,
-        )?;
+        let tls_listener = TlsListener::new(listener, &cert_path, &key_path, mtls_config.as_ref())?;
         let make_svc = router.into_make_service_with_connect_info::<TlsConnInfo>();
         tokio::select! {
             result = axum::serve(tls_listener, make_svc)
@@ -732,7 +762,7 @@ fn install_oauth_proxy_routes(
         }),
     );
 
-    let router = if proxy.introspection_url.is_some() {
+    let router = if proxy.expose_admin_endpoints && proxy.introspection_url.is_some() {
         let proxy_introspect = proxy.clone();
         let introspect_http = reqwest::Client::new();
         router.route(
@@ -747,7 +777,7 @@ fn install_oauth_proxy_routes(
         router
     };
 
-    let router = if proxy.revocation_url.is_some() {
+    let router = if proxy.expose_admin_endpoints && proxy.revocation_url.is_some() {
         let proxy_revoke = proxy.clone();
         let revoke_http = reqwest::Client::new();
         router.route(
@@ -763,8 +793,8 @@ fn install_oauth_proxy_routes(
     };
 
     tracing::info!(
-        introspect = proxy.introspection_url.is_some(),
-        revoke = proxy.revocation_url.is_some(),
+        introspect = proxy.expose_admin_endpoints && proxy.introspection_url.is_some(),
+        revoke = proxy.expose_admin_endpoints && proxy.revocation_url.is_some(),
         "OAuth 2.1 proxy endpoints enabled (/authorize, /token, /register)"
     );
     router
@@ -818,28 +848,33 @@ fn derive_allowed_hosts(bind_addr: &str, public_url: Option<&str>) -> Vec<String
 /// Implement axum's `Connected` trait for `TlsConnInfo` so that
 /// `ConnectInfo<TlsConnInfo>` is available in middleware when serving
 /// over our custom `TlsListener`.
+///
+/// The identity is read directly from the wrapping
+/// [`AuthenticatedTlsStream`], which guarantees one-to-one correspondence
+/// between the TLS connection and its mTLS identity. This eliminates the
+/// previous shared-map approach which was vulnerable to ephemeral-port
+/// reuse races (an unauthenticated reconnection from the same `(IP, port)`
+/// pair could alias a stale entry).
 impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
     for TlsConnInfo
 {
     fn connect_info(target: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
-        TlsConnInfo(*target.remote_addr())
+        let addr = *target.remote_addr();
+        let identity = target.io().identity().cloned();
+        TlsConnInfo::new(addr, identity)
     }
 }
-
-/// Maximum mTLS identity map entries before eviction. Entries are keyed by
-/// peer `SocketAddr` (IP + ephemeral port) and become stale once the TCP
-/// connection closes, so 10 000 is well above realistic concurrency.
-const MAX_MTLS_ENTRIES: usize = 10_000;
 
 /// A TLS-wrapping listener that implements axum's `Listener` trait.
 ///
 /// When mTLS is configured, verifies client certificates against the
-/// configured CA and stores extracted identities in a shared map for
-/// the auth middleware to consume.
+/// configured CA and extracts the client identity at handshake time.
+/// The extracted identity is bound to the connection itself via the
+/// returned [`AuthenticatedTlsStream`], so it is impossible for an
+/// unrelated connection to observe it.
 struct TlsListener {
     inner: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
-    mtls_identities: MtlsIdentities,
     mtls_default_role: String,
 }
 
@@ -849,7 +884,6 @@ impl TlsListener {
         cert_path: &Path,
         key_path: &Path,
         mtls_config: Option<&MtlsConfig>,
-        mtls_identities: MtlsIdentities,
     ) -> anyhow::Result<Self> {
         // Install the ring crypto provider (ok to call multiple times).
         rustls::crypto::ring::default_provider()
@@ -912,56 +946,106 @@ impl TlsListener {
         Ok(Self {
             inner,
             acceptor,
-            mtls_identities,
             mtls_default_role,
         })
     }
+
+    /// Extract the mTLS client cert identity from a completed TLS handshake.
+    /// Returns `None` if no client certificate was presented or if the
+    /// certificate could not be parsed into an [`AuthIdentity`].
+    fn extract_handshake_identity(
+        tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        default_role: &str,
+        addr: SocketAddr,
+    ) -> Option<AuthIdentity> {
+        let (_, server_conn) = tls_stream.get_ref();
+        let cert_der = server_conn.peer_certificates()?.first()?;
+        let id = extract_mtls_identity(cert_der.as_ref(), default_role)?;
+        tracing::debug!(name = %id.name, peer = %addr, "mTLS client cert accepted");
+        Some(id)
+    }
 }
 
-impl TlsListener {
-    /// Extract the mTLS client cert identity from a completed TLS handshake
-    /// and, if present, record it in the shared identity map keyed by the
-    /// peer socket address. Evicts the oldest half of entries when the map
-    /// exceeds [`MAX_MTLS_ENTRIES`].
-    fn record_mtls_identity(
-        &self,
-        tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-        addr: SocketAddr,
-    ) {
-        let (_, server_conn) = tls_stream.get_ref();
-        let Some(certs) = server_conn.peer_certificates() else {
-            return;
-        };
-        let Some(cert_der) = certs.first() else {
-            return;
-        };
-        let Some(id) = extract_mtls_identity(cert_der.as_ref(), &self.mtls_default_role) else {
-            return;
-        };
+/// A TLS stream paired with the mTLS identity extracted at handshake time.
+///
+/// Wraps [`tokio_rustls::server::TlsStream`] so the verified client
+/// identity travels with the connection itself. This replaces the previous
+/// shared `MtlsIdentities` map, eliminating the
+/// `(SocketAddr) -> AuthIdentity` aliasing risk caused by ephemeral-port
+/// reuse and removing the need for an LRU eviction policy.
+///
+/// The wrapper is `Unpin` (its inner stream is `Unpin` because
+/// [`tokio::net::TcpStream`] is `Unpin`), so `AsyncRead`/`AsyncWrite`
+/// delegation uses safe pin projection via `Pin::new(&mut self.inner)`.
+pub struct AuthenticatedTlsStream {
+    inner: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    identity: Option<AuthIdentity>,
+}
 
-        tracing::debug!(name = %id.name, peer = %addr, "mTLS client cert accepted");
+impl AuthenticatedTlsStream {
+    /// Returns the verified mTLS client identity, if any.
+    #[must_use]
+    pub const fn identity(&self) -> Option<&AuthIdentity> {
+        self.identity.as_ref()
+    }
+}
 
-        let Ok(mut map) = self.mtls_identities.write() else {
-            return;
-        };
-        map.insert(addr, id);
+impl std::fmt::Debug for AuthenticatedTlsStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedTlsStream")
+            .field("identity", &self.identity.as_ref().map(|id| &id.name))
+            .finish_non_exhaustive()
+    }
+}
 
-        // Evict stale entries when the map grows too large. Entries are
-        // keyed by peer SocketAddr (IP + ephemeral port); once a TCP
-        // connection closes the port is recycled, so old entries are
-        // effectively dead.
-        if map.len() > MAX_MTLS_ENTRIES {
-            let keys: Vec<SocketAddr> = map.keys().take(map.len() / 2).copied().collect();
-            for key in keys {
-                map.remove(&key);
-            }
-            tracing::debug!(remaining = map.len(), "evicted stale mTLS identity entries");
-        }
+impl tokio::io::AsyncRead for AuthenticatedTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for AuthenticatedTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 }
 
 impl axum::serve::Listener for TlsListener {
-    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Io = AuthenticatedTlsStream;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -980,8 +1064,13 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
-            self.record_mtls_identity(&tls_stream, addr);
-            return (tls_stream, addr);
+            let identity =
+                Self::extract_handshake_identity(&tls_stream, &self.mtls_default_role, addr);
+            let wrapped = AuthenticatedTlsStream {
+                inner: tls_stream,
+                identity,
+            };
+            return (wrapped, addr);
         }
     }
 

@@ -27,3 +27,6 @@ Thumbs.db
 *.key
 !tests/**/*.pem
 !tests/**/*.key
+
+# Agent / planning scratchpad (not part of the crate)
+/.sisyphus/

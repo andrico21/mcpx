@@ -192,7 +192,6 @@ mod tests {
                 "argon2id-hash",
                 "admin",
             )]),
-            mtls_identities: Arc::new(std::sync::RwLock::new(std::collections::HashMap::default())),
             rate_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,

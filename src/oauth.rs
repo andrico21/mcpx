@@ -98,6 +98,111 @@ impl Default for OAuthConfig {
     }
 }
 
+impl OAuthConfig {
+    /// Start building an [`OAuthConfig`] with the three required fields.
+    ///
+    /// All other fields default to the same values as
+    /// [`OAuthConfig::default`] (empty scopes/role mappings, no proxy or
+    /// token exchange, a JWKS cache TTL of `10m`).
+    pub fn builder(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        jwks_uri: impl Into<String>,
+    ) -> OAuthConfigBuilder {
+        OAuthConfigBuilder {
+            inner: Self {
+                issuer: issuer.into(),
+                audience: audience.into(),
+                jwks_uri: jwks_uri.into(),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+/// Builder for [`OAuthConfig`].
+///
+/// Obtain via [`OAuthConfig::builder`]. All setters consume `self` and
+/// return a new builder, so they compose fluently. Call
+/// [`OAuthConfigBuilder::build`] to produce the final [`OAuthConfig`].
+#[derive(Debug, Clone)]
+#[must_use = "builders do nothing until `.build()` is called"]
+pub struct OAuthConfigBuilder {
+    inner: OAuthConfig,
+}
+
+impl OAuthConfigBuilder {
+    /// Replace the scope-to-role mappings.
+    pub fn scopes(mut self, scopes: Vec<ScopeMapping>) -> Self {
+        self.inner.scopes = scopes;
+        self
+    }
+
+    /// Append a single scope-to-role mapping.
+    pub fn scope(mut self, scope: impl Into<String>, role: impl Into<String>) -> Self {
+        self.inner.scopes.push(ScopeMapping {
+            scope: scope.into(),
+            role: role.into(),
+        });
+        self
+    }
+
+    /// Set the JWT claim path used to extract roles directly (without
+    /// going through `scope` mappings).
+    pub fn role_claim(mut self, claim: impl Into<String>) -> Self {
+        self.inner.role_claim = Some(claim.into());
+        self
+    }
+
+    /// Replace the claim-value-to-role mappings.
+    pub fn role_mappings(mut self, mappings: Vec<RoleMapping>) -> Self {
+        self.inner.role_mappings = mappings;
+        self
+    }
+
+    /// Append a single claim-value-to-role mapping (used with
+    /// [`Self::role_claim`]).
+    pub fn role_mapping(mut self, claim_value: impl Into<String>, role: impl Into<String>) -> Self {
+        self.inner.role_mappings.push(RoleMapping {
+            claim_value: claim_value.into(),
+            role: role.into(),
+        });
+        self
+    }
+
+    /// Override the JWKS cache TTL (humantime string, e.g. `"5m"`).
+    /// Defaults to `"10m"`.
+    pub fn jwks_cache_ttl(mut self, ttl: impl Into<String>) -> Self {
+        self.inner.jwks_cache_ttl = ttl.into();
+        self
+    }
+
+    /// Attach an OAuth proxy configuration. When set, the server
+    /// exposes `/authorize`, `/token`, and `/register` endpoints.
+    pub fn proxy(mut self, proxy: OAuthProxyConfig) -> Self {
+        self.inner.proxy = Some(proxy);
+        self
+    }
+
+    /// Attach an RFC 8693 token exchange configuration.
+    pub fn token_exchange(mut self, token_exchange: TokenExchangeConfig) -> Self {
+        self.inner.token_exchange = Some(token_exchange);
+        self
+    }
+
+    /// Provide a PEM CA bundle path used only when fetching the JWKS.
+    pub fn ca_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.inner.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Finalise the builder and return the [`OAuthConfig`].
+    #[must_use]
+    pub fn build(self) -> OAuthConfig {
+        self.inner
+    }
+}
+
 /// Maps an OAuth scope string to an RBAC role name.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
@@ -210,15 +315,106 @@ pub struct OAuthProxyConfig {
     pub client_id: String,
     /// OAuth `client_secret` (for confidential clients). Omit for public clients.
     pub client_secret: Option<secrecy::SecretString>,
-    /// Optional upstream RFC 7662 introspection endpoint. When set,
-    /// the server exposes a local `/introspect` endpoint that proxies
-    /// to it.
+    /// Optional upstream RFC 7662 introspection endpoint. When set
+    /// **and** [`Self::expose_admin_endpoints`] is `true`, the server
+    /// exposes a local `/introspect` endpoint that proxies to it.
     #[serde(default)]
     pub introspection_url: Option<String>,
-    /// Optional upstream RFC 7009 revocation endpoint. When set,
-    /// the server exposes a local `/revoke` endpoint that proxies to it.
+    /// Optional upstream RFC 7009 revocation endpoint. When set
+    /// **and** [`Self::expose_admin_endpoints`] is `true`, the server
+    /// exposes a local `/revoke` endpoint that proxies to it.
     #[serde(default)]
     pub revocation_url: Option<String>,
+    /// Whether to expose the OAuth admin endpoints (`/introspect`,
+    /// `/revoke`) and advertise them in the authorization-server
+    /// metadata document.
+    ///
+    /// **Default: `false`.** These endpoints are unauthenticated at the
+    /// transport layer (the OAuth proxy router is mounted outside the
+    /// MCP auth middleware) and proxy directly to the upstream `IdP`. If
+    /// enabled, you are responsible for restricting access at the
+    /// network boundary (firewall, reverse proxy, mTLS) or by routing
+    /// the entire mcpx process behind an authenticated ingress. Leaving
+    /// this `false` (the default) makes the endpoints return 404.
+    #[serde(default)]
+    pub expose_admin_endpoints: bool,
+}
+
+impl OAuthProxyConfig {
+    /// Start building an [`OAuthProxyConfig`] with the three required
+    /// upstream fields.
+    ///
+    /// Optional settings (`client_secret`, `introspection_url`,
+    /// `revocation_url`, `expose_admin_endpoints`) default to their
+    /// [`Default`] values and can be set via the corresponding builder
+    /// methods.
+    pub fn builder(
+        authorize_url: impl Into<String>,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> OAuthProxyConfigBuilder {
+        OAuthProxyConfigBuilder {
+            inner: Self {
+                authorize_url: authorize_url.into(),
+                token_url: token_url.into(),
+                client_id: client_id.into(),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+/// Builder for [`OAuthProxyConfig`].
+///
+/// Obtain via [`OAuthProxyConfig::builder`]. See the type-level docs on
+/// [`OAuthProxyConfig`] and in particular the security caveats on
+/// [`OAuthProxyConfig::expose_admin_endpoints`].
+#[derive(Debug, Clone)]
+#[must_use = "builders do nothing until `.build()` is called"]
+pub struct OAuthProxyConfigBuilder {
+    inner: OAuthProxyConfig,
+}
+
+impl OAuthProxyConfigBuilder {
+    /// Set the upstream OAuth client secret. Omit for public clients.
+    pub fn client_secret(mut self, secret: secrecy::SecretString) -> Self {
+        self.inner.client_secret = Some(secret);
+        self
+    }
+
+    /// Configure the upstream RFC 7662 introspection endpoint. Only
+    /// advertised and reachable when
+    /// [`Self::expose_admin_endpoints`] is also set to `true`.
+    pub fn introspection_url(mut self, url: impl Into<String>) -> Self {
+        self.inner.introspection_url = Some(url.into());
+        self
+    }
+
+    /// Configure the upstream RFC 7009 revocation endpoint. Only
+    /// advertised and reachable when
+    /// [`Self::expose_admin_endpoints`] is also set to `true`.
+    pub fn revocation_url(mut self, url: impl Into<String>) -> Self {
+        self.inner.revocation_url = Some(url.into());
+        self
+    }
+
+    /// Opt in to exposing the `/introspect` and `/revoke` admin
+    /// endpoints and advertising them in the authorization-server
+    /// metadata document.
+    ///
+    /// **Security:** see the field-level documentation on
+    /// [`OAuthProxyConfig::expose_admin_endpoints`] for the caveats
+    /// before enabling this.
+    pub const fn expose_admin_endpoints(mut self, expose: bool) -> Self {
+        self.inner.expose_admin_endpoints = expose;
+        self
+    }
+
+    /// Finalise the builder and return the [`OAuthProxyConfig`].
+    #[must_use]
+    pub fn build(self) -> OAuthProxyConfig {
+        self.inner
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +1053,7 @@ pub fn authorization_server_metadata(server_url: &str, config: &OAuthConfig) -> 
         "token_endpoint_auth_methods_supported": ["none"],
     });
     if let Some(proxy) = &config.proxy
+        && proxy.expose_admin_endpoints
         && let Some(obj) = meta.as_object_mut()
     {
         if proxy.introspection_url.is_some() {
@@ -2058,6 +2255,7 @@ mod tests {
             client_secret: Some(secrecy::SecretString::from("shh".to_owned())),
             introspection_url: None,
             revocation_url: None,
+            expose_admin_endpoints: false,
         }
     }
 
@@ -2144,10 +2342,27 @@ mod tests {
         assert!(m.get("introspection_endpoint").is_none());
         assert!(m.get("revocation_endpoint").is_none());
 
-        // With proxy + introspection_url only.
+        // With proxy + introspection_url but expose_admin_endpoints = false
+        // (the secure default): endpoints MUST NOT be advertised.
         let mut proxy = proxy_cfg("https://upstream.local/token");
         proxy.introspection_url = Some("https://upstream.local/introspect".into());
+        proxy.revocation_url = Some("https://upstream.local/revoke".into());
         cfg.proxy = Some(proxy);
+        let m = authorization_server_metadata("https://mcp.local", &cfg);
+        assert!(
+            m.get("introspection_endpoint").is_none(),
+            "introspection must not be advertised when expose_admin_endpoints=false"
+        );
+        assert!(
+            m.get("revocation_endpoint").is_none(),
+            "revocation must not be advertised when expose_admin_endpoints=false"
+        );
+
+        // Opt in: expose_admin_endpoints = true + introspection_url only.
+        if let Some(p) = cfg.proxy.as_mut() {
+            p.expose_admin_endpoints = true;
+            p.revocation_url = None;
+        }
         let m = authorization_server_metadata("https://mcp.local", &cfg);
         assert_eq!(
             m["introspection_endpoint"],

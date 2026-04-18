@@ -7,12 +7,12 @@
 //! Includes per-source-IP rate limiting on authentication attempts.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
     path::PathBuf,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -364,16 +364,32 @@ impl AuthConfig {
 /// Keyed rate limiter type (per source IP).
 type KeyedLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
-/// Shared map of mTLS identities keyed by peer socket address.
-/// Populated by the TLS acceptor, consumed by the auth middleware.
-pub type MtlsIdentities = Arc<RwLock<HashMap<SocketAddr, AuthIdentity>>>;
-
-/// Connection info for TLS connections, carrying the peer socket address.
+/// Connection info for TLS connections, carrying the peer socket address
+/// and (when mTLS is configured) the verified client identity extracted
+/// from the peer certificate during the TLS handshake.
+///
 /// Defined as a local type so we can implement axum's `Connected` trait
-/// for our custom `TlsListener` without orphan rule issues.
+/// for our custom `TlsListener` without orphan rule issues. The `identity`
+/// field travels with the connection itself (via the wrapping IO type),
+/// so there is no shared map to race against, no port-reuse aliasing, and
+/// no eviction policy to maintain.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct TlsConnInfo(pub SocketAddr);
+pub struct TlsConnInfo {
+    /// Remote peer socket address.
+    pub addr: SocketAddr,
+    /// Verified mTLS client identity, if a client certificate was presented
+    /// and successfully extracted during the TLS handshake.
+    pub identity: Option<AuthIdentity>,
+}
+
+impl TlsConnInfo {
+    /// Construct a new [`TlsConnInfo`].
+    #[must_use]
+    pub const fn new(addr: SocketAddr, identity: Option<AuthIdentity>) -> Self {
+        Self { addr, identity }
+    }
+}
 
 /// Shared state for the auth middleware.
 ///
@@ -387,8 +403,6 @@ pub struct TlsConnInfo(pub SocketAddr);
 pub struct AuthState {
     /// Active set of API keys (hot-swappable).
     pub api_keys: ArcSwap<Vec<ApiKeyEntry>>,
-    /// Per-peer mTLS identities populated by the TLS acceptor.
-    pub mtls_identities: MtlsIdentities,
     /// Optional per-IP rate limiter for auth attempts.
     pub rate_limiter: Option<Arc<KeyedLimiter>>,
     #[cfg(feature = "oauth")]
@@ -666,26 +680,20 @@ async fn authenticate_bearer_identity(
 /// Failed authentication attempts are rate-limited per source IP.
 /// Successful authentications do not consume rate limit budget.
 pub async fn auth_middleware(state: Arc<AuthState>, req: Request<Body>, next: Next) -> Response {
-    // Extract peer address from ConnectInfo (set by into_make_service_with_connect_info).
-    // Try both SocketAddr (plain TCP) and TlsConnInfo (TLS) variants.
+    // Extract peer address (and any mTLS identity) from ConnectInfo.
+    // Plain TCP: ConnectInfo<SocketAddr>. TLS / mTLS: ConnectInfo<TlsConnInfo>,
+    // which carries the verified identity directly on the connection — no
+    // shared map, no port-reuse aliasing.
+    let tls_info = req.extensions().get::<ConnectInfo<TlsConnInfo>>().cloned();
     let peer_addr = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0)
-        .or_else(|| {
-            req.extensions()
-                .get::<ConnectInfo<TlsConnInfo>>()
-                .map(|ci| ci.0.0)
-        });
+        .or_else(|| tls_info.as_ref().map(|ci| ci.0.addr));
 
-    // 1. Try mTLS identity (set by TLS acceptor during handshake).
-    if let Some(addr) = peer_addr
-        && let Some(id) = state
-            .mtls_identities
-            .read()
-            .ok()
-            .and_then(|map| map.get(&addr).cloned())
-    {
+    // 1. Try mTLS identity (extracted by the TLS acceptor during handshake
+    //    and attached to the connection itself).
+    if let Some(id) = tls_info.and_then(|ci| ci.0.identity) {
         state.log_auth(&id, "mTLS");
         let mut req = req;
         req.extensions_mut().insert(id);
@@ -908,7 +916,6 @@ mod tests {
     fn test_auth_state(keys: Vec<ApiKeyEntry>) -> Arc<AuthState> {
         Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(keys)),
-            mtls_identities: Arc::new(RwLock::new(HashMap::new())),
             rate_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
@@ -999,7 +1006,6 @@ mod tests {
     async fn middleware_rate_limits() {
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),
-            mtls_identities: Arc::new(RwLock::new(HashMap::new())),
             rate_limiter: Some(build_rate_limiter(&RateLimitConfig {
                 max_attempts_per_minute: 1,
             })),

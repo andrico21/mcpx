@@ -468,7 +468,7 @@ pub async fn rbac_middleware(
         .or_else(|| {
             req.extensions()
                 .get::<ConnectInfo<TlsConnInfo>>()
-                .map(|ci| ci.0.0.ip())
+                .map(|ci| ci.0.addr.ip())
         });
 
     // Extract caller identity and role (may be absent when auth is off).

@@ -3,7 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
+      # Glob (not regex) - GitHub Actions tag filters use fnmatch-style globs.
+      # Matches semver-shaped tags like "0.10.0", "1.2.3-rc1", etc.
+      # The "Verify tag matches Cargo.toml version" step below is the real
+      # safety gate; this filter just keeps unrelated tags from triggering.
+      - "*.*.*"
 
 jobs:
   publish:

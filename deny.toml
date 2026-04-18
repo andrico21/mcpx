@@ -4,9 +4,7 @@ yanked = "deny"
 # See .cargo/audit.toml for the rationale behind each ignored advisory.
 # RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa` 0.9.x (no upstream
 #   fix; mcpx validates JWTs with public keys only, not vulnerable).
-# RUSTSEC-2026-0097: `rand` 0.8.5 unsoundness with custom global logger
-#   (mcpx does not install such a logger).
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0097"]
+ignore = ["RUSTSEC-2023-0071"]
 
 [licenses]
 allow = [
