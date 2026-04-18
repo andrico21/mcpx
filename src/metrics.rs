@@ -1,6 +1,6 @@
 //! Prometheus metrics for MCP servers.
 //!
-//! Provides a shared [`McpMetrics`] registry with standard HTTP counters.
+//! Provides a shared [`crate::metrics::McpMetrics`] registry with standard HTTP counters.
 //! The transport layer exposes these via a `/metrics` endpoint on a
 //! dedicated listener when `metrics_enabled` is true.
 

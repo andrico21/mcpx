@@ -5,9 +5,9 @@
 //! secrets), auth counters, and an RBAC policy summary.
 //!
 //! The admin router is always wrapped in the existing auth + RBAC stack
-//! and additionally requires the caller's role to match
-//! [`AdminConfig::role`]. Configuration validation refuses to enable admin
-//! without auth.
+//! and additionally requires the caller's role to match the `role` field
+//! on [`crate::admin::AdminConfig`]. Configuration validation refuses to
+//! enable admin without auth.
 
 use std::{
     sync::Arc,

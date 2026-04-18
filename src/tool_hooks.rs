@@ -1,6 +1,6 @@
 //! Opt-in tool-call instrumentation for `ServerHandler` implementations.
 //!
-//! [`HookedHandler`] wraps any [`rmcp::ServerHandler`] with:
+//! [`crate::tool_hooks::HookedHandler`] wraps any [`rmcp::ServerHandler`] with:
 //!
 //! - **Before hooks** that observe `(tool_name, arguments, identity, role,
 //!   token, request_id)` and may deny a call.
@@ -87,7 +87,7 @@ pub type BeforeHook =
 /// `is_error` flag and approximate result size in bytes.
 pub type AfterHook = Arc<dyn Fn(&ToolCallContext, bool, usize) + Send + Sync + 'static>;
 
-/// Opt-in hooks applied by [`HookedHandler`].
+/// Opt-in hooks applied by [`crate::tool_hooks::HookedHandler`].
 #[allow(clippy::struct_field_names, reason = "before/after read naturally")]
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -129,7 +129,7 @@ impl<H: ServerHandler> fmt::Debug for HookedHandler<H> {
     }
 }
 
-/// Construct a [`HookedHandler`] from an inner handler and hooks.
+/// Construct a [`crate::tool_hooks::HookedHandler`] from an inner handler and hooks.
 pub fn with_hooks<H: ServerHandler>(inner: H, hooks: Arc<ToolHooks>) -> HookedHandler<H> {
     HookedHandler {
         inner: Arc::new(inner),
