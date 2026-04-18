@@ -35,7 +35,10 @@ impl ServerHandler for MinimalHandler {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
-    mcpx::observability::init_tracing("info,mcpx=debug");
+    // Ignore the error: the only failure mode is "a global tracing
+    // subscriber was already installed", which is harmless for an example
+    // that owns the entire process.
+    let _ = mcpx::observability::init_tracing("info,mcpx=debug");
 
     let config = McpServerConfig::new(
         "127.0.0.1:8080",

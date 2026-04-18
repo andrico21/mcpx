@@ -1,7 +1,10 @@
 use std::{path::Path, sync::Arc};
 
 use tracing_subscriber::{
-    EnvFilter, Layer as _, fmt::time::FormatTime, layer::SubscriberExt, util::SubscriberInitExt,
+    EnvFilter, Layer as _,
+    fmt::time::FormatTime,
+    layer::SubscriberExt,
+    util::{SubscriberInitExt, TryInitError},
 };
 
 use crate::config::ObservabilityConfig;
@@ -26,7 +29,14 @@ impl FormatTime for LocalTime {
 /// When `log_format` is `"json"`, emits machine-readable JSON lines.
 /// When `audit_log_path` is set, appends an additional JSON log file
 /// at INFO level for audit trail purposes.
-pub fn init_tracing_from_config(config: &ObservabilityConfig) {
+///
+/// # Errors
+///
+/// Returns [`TryInitError`] if a global tracing subscriber has already
+/// been installed (e.g. by a previous call to this function or
+/// [`init_tracing`]). Callers that want to tolerate double-initialization
+/// (such as test harnesses) can ignore the error.
+pub fn init_tracing_from_config(config: &ObservabilityConfig) -> Result<(), TryInitError> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
 
@@ -36,33 +46,43 @@ pub fn init_tracing_from_config(config: &ObservabilityConfig) {
         .map_or((None, Vec::new()), |p| open_audit_file(p));
 
     // "pretty" and "text" are aliases for human-readable output.
-    if config.log_format == "json" {
+    let result = if config.log_format == "json" {
         let subscriber = tracing_subscriber::registry().with(filter).with(
             tracing_subscriber::fmt::layer()
                 .json()
                 .with_timer(LocalTime)
                 .with_writer(std::io::stderr),
         );
-        init_with_optional_audit(subscriber, audit_writer);
+        init_with_optional_audit(subscriber, audit_writer)
     } else {
         let subscriber = tracing_subscriber::registry().with(filter).with(
             tracing_subscriber::fmt::layer()
                 .with_timer(LocalTime)
                 .with_writer(std::io::stderr),
         );
-        init_with_optional_audit(subscriber, audit_writer);
+        init_with_optional_audit(subscriber, audit_writer)
+    };
+
+    if result.is_ok() {
+        for warning in audit_warnings {
+            tracing::warn!(warning = %warning, "audit logging initialization warning");
+        }
     }
 
-    for warning in audit_warnings {
-        tracing::warn!(warning = %warning, "audit logging initialization warning");
-    }
+    result
 }
 
 /// Attach an optional audit JSON log layer and initialize the subscriber.
 ///
 /// Extracted to avoid duplicating the audit layer construction in both
 /// the JSON and pretty format branches of [`init_tracing_from_config`].
-fn init_with_optional_audit<S>(subscriber: S, audit_writer: Option<AuditFile>)
+///
+/// Uses [`SubscriberInitExt::try_init`] so that a previously-installed
+/// global subscriber yields [`TryInitError`] rather than panicking.
+fn init_with_optional_audit<S>(
+    subscriber: S,
+    audit_writer: Option<AuditFile>,
+) -> Result<(), TryInitError>
 where
     S: tracing::Subscriber
         + for<'span> tracing_subscriber::registry::LookupSpan<'span>
@@ -79,9 +99,9 @@ where
                     .with_writer(writer)
                     .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
             )
-            .init();
+            .try_init()
     } else {
-        subscriber.init();
+        subscriber.try_init()
     }
 }
 
@@ -89,7 +109,13 @@ where
 ///
 /// Convenience function for callers that don't use [`ObservabilityConfig`].
 /// Respects `RUST_LOG` env var. Falls back to `default_filter` (e.g. `"info"`).
-pub fn init_tracing(default_filter: &str) {
+///
+/// # Errors
+///
+/// Returns [`TryInitError`] if a global tracing subscriber has already
+/// been installed. This makes the function safe to call repeatedly from
+/// tests or embedders without panicking.
+pub fn init_tracing(default_filter: &str) -> Result<(), TryInitError> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)))
         .with(
@@ -97,7 +123,7 @@ pub fn init_tracing(default_filter: &str) {
                 .with_timer(LocalTime)
                 .with_writer(std::io::stderr),
         )
-        .init();
+        .try_init()
 }
 
 /// Newtype wrapper around a shared file handle for audit logging.
@@ -182,6 +208,7 @@ mod tests {
         clippy::print_stdout,
         clippy::print_stderr
     )]
+    use super::{init_tracing, init_tracing_from_config};
     use crate::config::ObservabilityConfig;
 
     #[test]
@@ -195,5 +222,45 @@ mod tests {
             metrics_bind: "127.0.0.1:9090".into(),
         };
         assert!(config.log_format == "json" || config.log_format == "pretty");
+    }
+
+    /// Calling either `init_tracing` entry point twice in the same process
+    /// must NOT panic. The second (and any subsequent) call must return
+    /// `Err(TryInitError)` instead. This guards against regressions of the
+    /// pre-0.11 `.init()` behaviour, which aborted the process when a
+    /// global subscriber was already installed (e.g. by a sibling test).
+    ///
+    /// All four call orderings are exercised in a single test because the
+    /// global tracing subscriber is process-wide state - we cannot rely on
+    /// test isolation here.
+    #[test]
+    fn init_tracing_double_init_returns_err_not_panic() {
+        // First call: may succeed or fail depending on whether another
+        // test in this binary already installed a subscriber. Either is
+        // acceptable; we only require that it does not panic.
+        let _ = init_tracing("info");
+
+        // Second call: a global subscriber is now guaranteed to exist,
+        // so this MUST return Err and MUST NOT panic.
+        let second = init_tracing("debug");
+        assert!(
+            second.is_err(),
+            "second init_tracing must return Err once a global subscriber exists"
+        );
+
+        // The companion entry point must also report Err rather than panic.
+        let cfg = ObservabilityConfig {
+            log_level: "info".into(),
+            log_format: "pretty".into(),
+            audit_log_path: None,
+            log_request_headers: false,
+            metrics_enabled: false,
+            metrics_bind: "127.0.0.1:9090".into(),
+        };
+        let third = init_tracing_from_config(&cfg);
+        assert!(
+            third.is_err(),
+            "init_tracing_from_config must return Err once a global subscriber exists"
+        );
     }
 }

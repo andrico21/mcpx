@@ -39,7 +39,7 @@ impl ServerHandler for MyHandler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    mcpx::observability::init_tracing("info,my_server=debug");
+    let _ = mcpx::observability::init_tracing("info,my_server=debug");
     let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0");
     serve(config, || MyHandler).await
 }

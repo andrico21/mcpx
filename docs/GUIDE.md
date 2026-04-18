@@ -62,7 +62,7 @@ impl ServerHandler for MyHandler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    mcpx::observability::init_tracing("info,my_server=debug");
+    let _ = mcpx::observability::init_tracing("info,my_server=debug");
 
     let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0");
     serve(config, || MyHandler).await
@@ -665,23 +665,29 @@ pub type Result<T> = std::result::Result<T, McpxError>;
 
 #### `init_tracing(default_filter)`
 
-Simple tracing initialization:
+Simple tracing initialization. Returns `Result<(), TryInitError>` so it
+is safe to call from tests or embedders that may have already installed
+a global subscriber:
 
 ```rust
-mcpx::observability::init_tracing("info,my_crate=debug");
+mcpx::observability::init_tracing("info,my_crate=debug")?;
 ```
 
 Respects `RUST_LOG` environment variable (takes precedence over the default).
+The `Err` variant indicates that a global tracing subscriber was already
+installed; production binaries can propagate the error, while embedders
+that tolerate double-initialization can ignore it (`let _ = init_tracing(..)`).
 
 #### `init_tracing_from_config(config)`
 
-Full initialization from `ObservabilityConfig`:
+Full initialization from `ObservabilityConfig`. Same `Result` semantics
+as [`init_tracing`]:
 
 ```rust
 use mcpx::config::ObservabilityConfig;
 
 let obs: ObservabilityConfig = toml::from_str(&config_toml)?;
-mcpx::observability::init_tracing_from_config(&obs);
+mcpx::observability::init_tracing_from_config(&obs)?;
 ```
 
 Features:
@@ -932,7 +938,7 @@ impl ServerHandler for MyHandler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    mcpx::observability::init_tracing("info");
+    let _ = mcpx::observability::init_tracing("info");
 
     // Generate API keys (in production, store hashes in a config file)
     let (admin_token, admin_hash) = generate_api_key();
