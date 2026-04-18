@@ -1209,7 +1209,7 @@ impl TlsListener {
 /// The wrapper is `Unpin` (its inner stream is `Unpin` because
 /// [`tokio::net::TcpStream`] is `Unpin`), so `AsyncRead`/`AsyncWrite`
 /// delegation uses safe pin projection via `Pin::new(&mut self.inner)`.
-pub struct AuthenticatedTlsStream {
+pub(crate) struct AuthenticatedTlsStream {
     inner: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     identity: Option<AuthIdentity>,
 }
@@ -1217,7 +1217,7 @@ pub struct AuthenticatedTlsStream {
 impl AuthenticatedTlsStream {
     /// Returns the verified mTLS client identity, if any.
     #[must_use]
-    pub const fn identity(&self) -> Option<&AuthIdentity> {
+    pub(crate) const fn identity(&self) -> Option<&AuthIdentity> {
         self.identity.as_ref()
     }
 }

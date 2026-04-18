@@ -28,6 +28,37 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 - `mcpx::McpxError` and `mcpx::Result` re-exports at the crate root
   for ergonomic downstream usage.
+- **[H-A3] Ergonomic `BoundedKeyedLimiter` constructors.** New
+  `BoundedKeyedLimiter::with_per_minute(rpm, max_keys, idle)` and
+  `with_per_second(rps, max_keys, idle)` build the per-key
+  [`governor::Quota`] internally and clamp the rate to `>= 1` so a
+  misconfigured `0` does not panic. The previous
+  `BoundedKeyedLimiter::new(quota, ...)` is now `pub(crate)`; external
+  callers must migrate to one of the new constructors.
+
+### Removed
+
+- **[H-A3] Internal-only types demoted from public API.** The
+  following items leaked into the public surface of 0.11 but were
+  never intended for downstream consumption. They are now
+  `pub(crate)`:
+  - `auth::AuthCounters`, `auth::KeyedLimiter`, `auth::TlsConnInfo`,
+    `auth::AuthState`, `auth::build_rate_limiter`,
+    `auth::build_pre_auth_limiter`, `auth::auth_middleware`
+  - `rbac::ToolRateLimiter`, `rbac::build_tool_rate_limiter`,
+    `rbac::build_tool_rate_limiter_with_bounds`,
+    `rbac::rbac_middleware`
+  - `transport::AuthenticatedTlsStream`
+  - `admin::AdminState`, `admin::admin_router` (constructed only by
+    `serve()` internally; never had a public constructor)
+  - `bounded_limiter::BoundedKeyedLimiter::new` (use
+    `with_per_minute` / `with_per_second` instead)
+
+  This shrinks the public API contract toward 1.0. Public types that
+  remain stable: `AuthIdentity`, `AuthMethod`, `AuthCountersSnapshot`,
+  `ApiKeyEntry`, `ApiKeySummary`, `RbacPolicy`, `RbacRole`,
+  `BoundedKeyedLimiter` (the type itself, just not its low-level
+  constructor).
 
 ## [0.11.0] - 2026-04-18
 

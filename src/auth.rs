@@ -142,7 +142,7 @@ pub struct AuthCountersSnapshot {
 
 /// Internal atomic counters backing [`AuthCountersSnapshot`].
 #[derive(Debug, Default)]
-pub struct AuthCounters {
+pub(crate) struct AuthCounters {
     success_mtls: AtomicU64,
     success_bearer: AtomicU64,
     success_oauth_jwt: AtomicU64,
@@ -461,7 +461,7 @@ impl AuthConfig {
 
 /// Keyed rate limiter type (per source IP). Memory-bounded by
 /// [`RateLimitConfig::max_tracked_keys`] to defend against IP-spray `DoS`.
-pub type KeyedLimiter = BoundedKeyedLimiter<IpAddr>;
+pub(crate) type KeyedLimiter = BoundedKeyedLimiter<IpAddr>;
 
 /// Connection info for TLS connections, carrying the peer socket address
 /// and (when mTLS is configured) the verified client identity extracted
@@ -474,7 +474,7 @@ pub type KeyedLimiter = BoundedKeyedLimiter<IpAddr>;
 /// no eviction policy to maintain.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct TlsConnInfo {
+pub(crate) struct TlsConnInfo {
     /// Remote peer socket address.
     pub addr: SocketAddr,
     /// Verified mTLS client identity, if a client certificate was presented
@@ -485,7 +485,7 @@ pub struct TlsConnInfo {
 impl TlsConnInfo {
     /// Construct a new [`TlsConnInfo`].
     #[must_use]
-    pub const fn new(addr: SocketAddr, identity: Option<AuthIdentity>) -> Self {
+    pub(crate) const fn new(addr: SocketAddr, identity: Option<AuthIdentity>) -> Self {
         Self { addr, identity }
     }
 }
@@ -499,7 +499,7 @@ impl TlsConnInfo {
     reason = "contains governor RateLimiter and JwksCache without Debug impls"
 )]
 #[non_exhaustive]
-pub struct AuthState {
+pub(crate) struct AuthState {
     /// Active set of API keys (hot-swappable).
     pub api_keys: ArcSwap<Vec<ApiKeyEntry>>,
     /// Optional per-IP post-failure rate limiter (consulted *after* auth fails).
@@ -523,7 +523,7 @@ impl AuthState {
     /// New requests immediately see the updated keys.
     /// In-flight requests that already loaded the old list finish
     /// using it -- no torn reads.
-    pub fn reload_keys(&self, keys: Vec<ApiKeyEntry>) {
+    pub(crate) fn reload_keys(&self, keys: Vec<ApiKeyEntry>) {
         let count = keys.len();
         self.api_keys.store(Arc::new(keys));
         tracing::info!(keys = count, "API keys reloaded");
@@ -531,13 +531,13 @@ impl AuthState {
 
     /// Snapshot auth counters for diagnostics and tests.
     #[must_use]
-    pub fn counters_snapshot(&self) -> AuthCountersSnapshot {
+    pub(crate) fn counters_snapshot(&self) -> AuthCountersSnapshot {
         self.counters.snapshot()
     }
 
     /// Produce the admin-endpoint list of API keys (metadata only, no hashes).
     #[must_use]
-    pub fn api_key_summaries(&self) -> Vec<ApiKeySummary> {
+    pub(crate) fn api_key_summaries(&self) -> Vec<ApiKeySummary> {
         self.api_keys
             .load()
             .iter()
@@ -571,7 +571,7 @@ const DEFAULT_AUTH_RATE: NonZeroU32 = NonZeroU32::new(30).unwrap();
 
 /// Create a post-failure rate limiter from config.
 #[must_use]
-pub fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
+pub(crate) fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
     let quota = governor::Quota::per_minute(
         NonZeroU32::new(config.max_attempts_per_minute).unwrap_or(DEFAULT_AUTH_RATE),
     );
@@ -589,7 +589,7 @@ pub fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
 /// keeps the gate generous enough for honest retries while still bounding
 /// attacker CPU on Argon2 verification.
 #[must_use]
-pub fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
+pub(crate) fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
     let resolved = config.pre_auth_max_per_minute.unwrap_or_else(|| {
         config
             .max_attempts_per_minute
@@ -843,7 +843,11 @@ fn pre_auth_gate(state: &AuthState, peer_addr: Option<SocketAddr>) -> Option<Res
 ///
 /// Failed authentication attempts are rate-limited per source IP.
 /// Successful authentications do not consume rate limit budget.
-pub async fn auth_middleware(state: Arc<AuthState>, req: Request<Body>, next: Next) -> Response {
+pub(crate) async fn auth_middleware(
+    state: Arc<AuthState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     // Extract peer address (and any mTLS identity) from ConnectInfo.
     // Plain TCP: ConnectInfo<SocketAddr>. TLS / mTLS: ConnectInfo<TlsConnInfo>,
     // which carries the verified identity directly on the connection — no

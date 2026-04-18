@@ -46,6 +46,7 @@
 use std::{
     collections::HashMap,
     hash::Hash,
+    num::NonZeroU32,
     sync::{Arc, Mutex, PoisonError, Weak},
     time::{Duration, Instant},
 };
@@ -125,7 +126,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// pruning happens lazily on every full-table insert. Both behaviours
     /// are correct.
     #[must_use]
-    pub fn new(quota: Quota, max_tracked_keys: usize, idle_eviction: Duration) -> Self {
+    pub(crate) fn new(quota: Quota, max_tracked_keys: usize, idle_eviction: Duration) -> Self {
         let inner = Arc::new(Inner {
             map: Mutex::new(HashMap::new()),
             quota,
@@ -134,6 +135,50 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         });
         Self::spawn_prune_task(&inner);
         Self { inner }
+    }
+
+    /// Construct a [`BoundedKeyedLimiter`] with a per-minute quota.
+    ///
+    /// Convenience constructor that builds a per-minute [`Quota`] from
+    /// `requests_per_minute`. The rate is clamped to a minimum of `1`
+    /// request/min so a misconfigured `0` does not panic at startup.
+    ///
+    /// * `requests_per_minute` -- per-key rate, clamped to `>= 1`.
+    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys.
+    ///   When reached, an insert first prunes idle entries then falls
+    ///   back to LRU eviction.
+    /// * `idle_eviction` -- entries whose `last_seen` is older than this
+    ///   are eligible for opportunistic pruning.
+    #[must_use]
+    pub fn with_per_minute(
+        requests_per_minute: u32,
+        max_tracked_keys: usize,
+        idle_eviction: Duration,
+    ) -> Self {
+        let rate = NonZeroU32::new(requests_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
+        Self::new(Quota::per_minute(rate), max_tracked_keys, idle_eviction)
+    }
+
+    /// Construct a [`BoundedKeyedLimiter`] with a per-second quota.
+    ///
+    /// Convenience constructor that builds a per-second [`Quota`] from
+    /// `requests_per_second`. The rate is clamped to a minimum of `1`
+    /// request/sec so a misconfigured `0` does not panic at startup.
+    ///
+    /// * `requests_per_second` -- per-key rate, clamped to `>= 1`.
+    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys.
+    ///   When reached, an insert first prunes idle entries then falls
+    ///   back to LRU eviction.
+    /// * `idle_eviction` -- entries whose `last_seen` is older than this
+    ///   are eligible for opportunistic pruning.
+    #[must_use]
+    pub fn with_per_second(
+        requests_per_second: u32,
+        max_tracked_keys: usize,
+        idle_eviction: Duration,
+    ) -> Self {
+        let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+        Self::new(Quota::per_second(rate), max_tracked_keys, idle_eviction)
     }
 
     /// Spawn the optional background prune task. No-op if there is no

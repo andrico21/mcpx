@@ -51,7 +51,7 @@ impl Default for AdminConfig {
 )]
 #[derive(Clone)]
 #[non_exhaustive]
-pub struct AdminState {
+pub(crate) struct AdminState {
     /// Server start instant, used for uptime.
     pub started_at: Instant,
     /// Server name for /admin/status.
@@ -157,7 +157,7 @@ pub async fn require_admin_role(
 /// The caller is expected to merge this router on top of their top-level
 /// router *after* the auth + RBAC middleware has been installed, so that
 /// by the time a request reaches this router the task-local role is set.
-pub fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
+pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
     let role: Arc<str> = Arc::from(config.role.as_str());
     Router::new()
         .route("/admin/status", get(status_handler))

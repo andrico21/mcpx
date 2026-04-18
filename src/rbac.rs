@@ -31,7 +31,7 @@ use crate::{
 
 /// Per-source-IP rate limiter for tool invocations. Memory-bounded against
 /// IP-spray `DoS` via [`BoundedKeyedLimiter`].
-pub type ToolRateLimiter = BoundedKeyedLimiter<IpAddr>;
+pub(crate) type ToolRateLimiter = BoundedKeyedLimiter<IpAddr>;
 
 /// Default tool rate limit: 120 invocations per minute per source IP.
 // SAFETY: unwrap() is safe - literal 120 is provably non-zero (const-evaluated).
@@ -50,7 +50,7 @@ const DEFAULT_TOOL_IDLE_EVICTION: Duration = Duration::from_mins(15);
 /// `DEFAULT_TOOL_IDLE_EVICTION` idle eviction. Use
 /// [`build_tool_rate_limiter_with_bounds`] to override.
 #[must_use]
-pub fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter> {
+pub(crate) fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter> {
     build_tool_rate_limiter_with_bounds(
         max_per_minute,
         DEFAULT_TOOL_MAX_TRACKED_KEYS,
@@ -60,7 +60,7 @@ pub fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter> {
 
 /// Build a per-IP tool rate limiter with explicit memory-bound parameters.
 #[must_use]
-pub fn build_tool_rate_limiter_with_bounds(
+pub(crate) fn build_tool_rate_limiter_with_bounds(
     max_per_minute: u32,
     max_tracked_keys: usize,
     idle_eviction: Duration,
@@ -581,7 +581,7 @@ fn redact_with_salt(salt: &[u8], value: &str) -> String {
 // linear body-collect + JSON-RPC parse + dispatch, intentionally left
 // inline to keep the request lifecycle visible at a glance.
 #[allow(clippy::too_many_lines)]
-pub async fn rbac_middleware(
+pub(crate) async fn rbac_middleware(
     policy: Arc<RbacPolicy>,
     tool_limiter: Option<Arc<ToolRateLimiter>>,
     req: Request<Body>,

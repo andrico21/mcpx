@@ -13,9 +13,8 @@
 
 #![allow(clippy::expect_used, clippy::print_stderr, clippy::cast_precision_loss)]
 
-use std::{net::IpAddr, num::NonZeroU32, time::Duration};
+use std::{net::IpAddr, time::Duration};
 
-use governor::Quota;
 use mcpx::bounded_limiter::BoundedKeyedLimiter;
 
 /// Maximum permissible RSS growth (in MiB) over the test body.
@@ -39,9 +38,8 @@ fn one_million_ips_holds_under_50mib() {
         .expect("memory_stats unavailable on this platform")
         .physical_mem;
 
-    let quota = Quota::per_minute(NonZeroU32::new(10).expect("10 is non-zero"));
     let limiter: BoundedKeyedLimiter<IpAddr> =
-        BoundedKeyedLimiter::new(quota, MAX_TRACKED, Duration::from_mins(15));
+        BoundedKeyedLimiter::with_per_minute(10, MAX_TRACKED, Duration::from_mins(15));
 
     for i in 0..TOTAL_KEYS {
         let _ = limiter.check_key(&IpAddr::from(i.to_be_bytes()));
