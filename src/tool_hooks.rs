@@ -2,32 +2,40 @@
 //!
 //! [`crate::tool_hooks::HookedHandler`] wraps any [`rmcp::ServerHandler`] with:
 //!
-//! - **Before hooks** that observe `(tool_name, arguments, identity, role,
-//!   token, request_id)` and may deny a call.
-//! - **After hooks** that observe the same context plus the returned result
-//!   (or error) for auditing and metrics.
+//! - **Before hooks** (async) that observe `(tool_name, arguments, identity,
+//!   role, sub, request_id)` and may [`HookOutcome::Continue`],
+//!   [`HookOutcome::Deny`], or [`HookOutcome::Replace`] the call.
+//! - **After hooks** (async) that observe the same context plus a
+//!   [`HookDisposition`] describing how the call resolved and the
+//!   approximate result size in bytes.  After-hooks are spawned via
+//!   `tokio::spawn` and never block the response path.
 //! - **Result-size capping**: serialized tool results larger than
 //!   `max_result_bytes` are replaced with a structured error, preventing
 //!   token-expensive or memory-expensive payloads from reaching clients.
+//!   The cap applies both to inner-handler results and to
+//!   [`HookOutcome::Replace`] payloads.
 //!
 //! This is entirely **opt-in** at the application layer - `mcpx::serve()`
 //! does not wrap handlers automatically.  Applications that want hooks do:
 //!
-//! ```ignore
+//! ```no_run
 //! use std::sync::Arc;
-//! use mcpx::tool_hooks::{HookedHandler, ToolHooks, with_hooks};
+//! use mcpx::tool_hooks::{HookedHandler, HookOutcome, ToolHooks, with_hooks};
 //!
-//! let handler = MyHandler::new();
-//! let hooks = Arc::new(ToolHooks {
-//!     max_result_bytes: Some(256 * 1024),
-//!     before: None,
-//!     after: None,
-//! });
-//! let wrapped = with_hooks(handler, hooks);
-//! mcpx::transport::serve(config, move |_| wrapped.clone(), ...).await?;
+//! # #[derive(Clone, Default)]
+//! # struct MyHandler;
+//! # impl rmcp::ServerHandler for MyHandler {}
+//! let handler = MyHandler::default();
+//! let hooks = Arc::new(
+//!     ToolHooks::new()
+//!         .with_max_result_bytes(256 * 1024)
+//!         .with_before(Arc::new(|_ctx| Box::pin(async { HookOutcome::Continue })))
+//!         .with_after(Arc::new(|_ctx, _disp, _bytes| Box::pin(async {}))),
+//! );
+//! let _wrapped = with_hooks(handler, hooks);
 //! ```
 
-use std::{fmt, sync::Arc};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
@@ -58,10 +66,69 @@ pub struct ToolCallContext {
     pub request_id: Option<String>,
 }
 
-/// Error returned by a before hook to deny a tool call.
+impl ToolCallContext {
+    /// Construct a [`ToolCallContext`] with the given tool name and all
+    /// optional fields cleared.  Primarily for use in unit tests and
+    /// benchmarks of user-supplied hooks; the runtime path populates
+    /// these fields from the request and task-local RBAC state.
+    #[must_use]
+    pub fn for_tool(tool_name: impl Into<String>) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            arguments: None,
+            identity: None,
+            role: None,
+            sub: None,
+            request_id: None,
+        }
+    }
+}
+
+/// Outcome returned by a [`BeforeHook`] to control invocation flow.
 ///
-/// [`ToolHookError::Deny`] short-circuits invocation and returns the
-/// supplied message to the client as an `ErrorData::invalid_request`.
+/// - [`HookOutcome::Continue`] - proceed with the wrapped handler.
+/// - [`HookOutcome::Deny`] - reject the call with the supplied
+///   [`ErrorData`]; the inner handler is **not** called.
+/// - [`HookOutcome::Replace`] - return the supplied result instead of
+///   invoking the inner handler.  The result is still subject to
+///   `max_result_bytes` capping.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum HookOutcome {
+    /// Proceed with the wrapped handler.
+    Continue,
+    /// Reject the call.  The error is propagated to the client as-is.
+    Deny(ErrorData),
+    /// Skip the inner handler and return the supplied result instead.
+    Replace(Box<CallToolResult>),
+}
+
+/// How a tool call resolved, passed to the [`AfterHook`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum HookDisposition {
+    /// The inner handler ran and returned `Ok`.
+    InnerExecuted,
+    /// The inner handler ran and returned `Err`.
+    InnerErrored,
+    /// The before-hook returned [`HookOutcome::Deny`].
+    DeniedBefore,
+    /// The before-hook returned [`HookOutcome::Replace`].
+    ReplacedBefore,
+    /// The result (from inner or replace) exceeded `max_result_bytes`
+    /// and was substituted with a structured error.
+    ResultTooLarge,
+}
+
+/// Legacy synchronous deny error.
+///
+/// Retained as a stable name for users still wiring the 0.11 API.  New
+/// code should construct [`HookOutcome::Deny`] directly with an
+/// [`ErrorData`].
+#[deprecated(
+    since = "0.12.0",
+    note = "use HookOutcome::Deny(ErrorData::invalid_request(..)) instead; this enum will be removed in 0.13"
+)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ToolHookError {
@@ -69,6 +136,7 @@ pub enum ToolHookError {
     Deny(String),
 }
 
+#[allow(deprecated, reason = "Display impl for the deprecated enum")]
 impl fmt::Display for ToolHookError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -77,15 +145,39 @@ impl fmt::Display for ToolHookError {
     }
 }
 
+#[allow(deprecated, reason = "Error impl for the deprecated enum")]
 impl std::error::Error for ToolHookError {}
 
-/// Before-hook callback type. Return `Err(Deny(msg))` to reject the call.
-pub type BeforeHook =
-    Arc<dyn Fn(&ToolCallContext) -> Result<(), ToolHookError> + Send + Sync + 'static>;
+/// Async before-hook callback type.
+///
+/// Returns a [`HookOutcome`] controlling whether the inner handler runs.
+/// The borrow of `ToolCallContext` is held for the duration of the
+/// returned future, which avoids forcing implementations to clone the
+/// context for every invocation.
+pub type BeforeHook = Arc<
+    dyn for<'a> Fn(&'a ToolCallContext) -> Pin<Box<dyn Future<Output = HookOutcome> + Send + 'a>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
-/// After-hook callback type.  Receives the call context plus the
-/// `is_error` flag and approximate result size in bytes.
-pub type AfterHook = Arc<dyn Fn(&ToolCallContext, bool, usize) + Send + Sync + 'static>;
+/// Async after-hook callback type.
+///
+/// Receives the call context, a [`HookDisposition`] describing how the
+/// call resolved, and the approximate serialized result size in bytes
+/// (`0` for `DeniedBefore` and `InnerErrored`).  Spawned via
+/// `tokio::spawn`, so it must not assume it runs before the response is
+/// flushed.
+pub type AfterHook = Arc<
+    dyn for<'a> Fn(
+            &'a ToolCallContext,
+            HookDisposition,
+            usize,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Opt-in hooks applied by [`crate::tool_hooks::HookedHandler`].
 #[allow(clippy::struct_field_names, reason = "before/after read naturally")]
@@ -98,10 +190,45 @@ pub struct ToolHooks {
     /// the cap.
     pub max_result_bytes: Option<usize>,
     /// Optional before-hook invoked after arg deserialization, before
-    /// the wrapped handler is called.  May deny the call.
+    /// the wrapped handler is called.
     pub before: Option<BeforeHook>,
-    /// Optional after-hook invoked after the wrapped handler returns.
+    /// Optional after-hook invoked once per call, regardless of how the
+    /// call resolved.  Spawned via `tokio::spawn` and never blocks the
+    /// response path.
     pub after: Option<AfterHook>,
+}
+
+impl ToolHooks {
+    /// Construct an empty [`ToolHooks`] with no cap and no hooks.
+    ///
+    /// Use the `with_*` builder methods to populate fields; this avoids
+    /// the `#[non_exhaustive]` restriction that prevents struct-literal
+    /// construction from outside the crate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the serialized result size cap in bytes.
+    #[must_use]
+    pub fn with_max_result_bytes(mut self, max: usize) -> Self {
+        self.max_result_bytes = Some(max);
+        self
+    }
+
+    /// Set the before-hook.
+    #[must_use]
+    pub fn with_before(mut self, before: BeforeHook) -> Self {
+        self.before = Some(before);
+        self
+    }
+
+    /// Set the after-hook.
+    #[must_use]
+    pub fn with_after(mut self, after: AfterHook) -> Self {
+        self.after = Some(after);
+        self
+    }
 }
 
 impl fmt::Debug for ToolHooks {
@@ -154,6 +281,32 @@ impl<H: ServerHandler> HookedHandler<H> {
             request_id: req_id,
         }
     }
+
+    /// Spawn the after-hook on the current Tokio runtime.  The future
+    /// captures clones of `ctx` and the `Arc<AfterHook>` so it can run
+    /// independently of the request task; panics inside the after-hook
+    /// are caught by Tokio and never poison the response path.
+    fn spawn_after(
+        after: Option<&Arc<AfterHookHolder>>,
+        ctx: ToolCallContext,
+        disposition: HookDisposition,
+        size: usize,
+    ) {
+        if let Some(after) = after {
+            let after = Arc::clone(after);
+            tokio::spawn(async move {
+                let fut = (after.f)(&ctx, disposition, size);
+                fut.await;
+            });
+        }
+    }
+}
+
+/// Internal newtype that owns the [`AfterHook`] so we can `Arc::clone`
+/// the *holder* and let the spawned task borrow `ctx` for the lifetime
+/// of the future without lifetime acrobatics in `tokio::spawn`.
+struct AfterHookHolder {
+    f: AfterHook,
 }
 
 /// Structured error body returned when a result exceeds `max_result_bytes`.
@@ -174,6 +327,30 @@ fn too_large_result(limit: usize, actual: usize, tool: &str) -> CallToolResult {
 
 fn serialized_size(result: &CallToolResult) -> usize {
     serde_json::to_vec(result).map_or(0, |v| v.len())
+}
+
+/// Apply the `max_result_bytes` cap to a result.  Returns the (possibly
+/// replaced) result, the size used for accounting, and whether the cap
+/// fired.
+fn apply_size_cap(
+    result: CallToolResult,
+    max: Option<usize>,
+    tool: &str,
+) -> (CallToolResult, usize, bool) {
+    let size = serialized_size(&result);
+    if let Some(limit) = max
+        && size > limit
+    {
+        tracing::warn!(
+            tool = %tool,
+            size_bytes = size,
+            limit_bytes = limit,
+            "tool result exceeds max_result_bytes; replacing with structured error"
+        );
+        let replaced = too_large_result(limit, size, tool);
+        return (replaced, size, true);
+    }
+    (result, size, false)
 }
 
 impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
@@ -248,44 +425,51 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     ) -> Result<CallToolResult, ErrorData> {
         let req_id = Some(format!("{:?}", context.id));
         let ctx = Self::build_context(&request, req_id);
+        let max = self.hooks.max_result_bytes;
+        let after_holder = self
+            .hooks
+            .after
+            .as_ref()
+            .map(|f| Arc::new(AfterHookHolder { f: Arc::clone(f) }));
 
-        // Before hook: may deny.
-        if let Some(before) = self.hooks.before.as_ref()
-            && let Err(ToolHookError::Deny(msg)) = before(&ctx)
-        {
-            if let Some(after) = self.hooks.after.as_ref() {
-                after(&ctx, true, 0);
+        // Before hook: may Continue, Deny, or Replace.
+        if let Some(before) = self.hooks.before.as_ref() {
+            let outcome = before(&ctx).await;
+            match outcome {
+                HookOutcome::Continue => {}
+                HookOutcome::Deny(err) => {
+                    Self::spawn_after(after_holder.as_ref(), ctx, HookDisposition::DeniedBefore, 0);
+                    return Err(err);
+                }
+                HookOutcome::Replace(boxed) => {
+                    let (final_result, size, capped) = apply_size_cap(*boxed, max, &ctx.tool_name);
+                    let disposition = if capped {
+                        HookDisposition::ResultTooLarge
+                    } else {
+                        HookDisposition::ReplacedBefore
+                    };
+                    Self::spawn_after(after_holder.as_ref(), ctx, disposition, size);
+                    return Ok(final_result);
+                }
             }
-            return Err(ErrorData::invalid_request(msg, None));
         }
 
         // Inner handler.
         let result = self.inner.call_tool(request, context).await;
 
-        // Size cap + after hook.
         match result {
-            Ok(mut ok) => {
-                let size = serialized_size(&ok);
-                if let Some(limit) = self.hooks.max_result_bytes
-                    && size > limit
-                {
-                    tracing::warn!(
-                        tool = %ctx.tool_name,
-                        size_bytes = size,
-                        limit_bytes = limit,
-                        "tool result exceeds max_result_bytes; replacing with structured error"
-                    );
-                    ok = too_large_result(limit, size, &ctx.tool_name);
-                }
-                if let Some(after) = self.hooks.after.as_ref() {
-                    after(&ctx, ok.is_error.unwrap_or(false), size);
-                }
-                Ok(ok)
+            Ok(ok) => {
+                let (final_result, size, capped) = apply_size_cap(ok, max, &ctx.tool_name);
+                let disposition = if capped {
+                    HookDisposition::ResultTooLarge
+                } else {
+                    HookDisposition::InnerExecuted
+                };
+                Self::spawn_after(after_holder.as_ref(), ctx, disposition, size);
+                Ok(final_result)
             }
             Err(e) => {
-                if let Some(after) = self.hooks.after.as_ref() {
-                    after(&ctx, true, 0);
-                }
+                Self::spawn_after(after_holder.as_ref(), ctx, HookDisposition::InnerErrored, 0);
                 Err(e)
             }
         }
@@ -329,14 +513,15 @@ mod tests {
         }
     }
 
-    /// Build a dummy `RequestContext`. We don't use rmcp's full wiring, so we
-    /// fabricate one via `Default` where possible, otherwise skip tests that
-    /// require a real context.
-    fn dummy_ctx() -> Option<RequestContext<RoleServer>> {
-        // RequestContext construction is not part of our public API in tests;
-        // these unit tests focus on the size-cap + hook wiring which can be
-        // exercised without a real context when we don't invoke inner.call_tool.
-        None
+    fn ctx(name: &str) -> ToolCallContext {
+        ToolCallContext {
+            tool_name: name.to_owned(),
+            arguments: None,
+            identity: None,
+            role: None,
+            sub: None,
+            request_id: None,
+        }
     }
 
     #[tokio::test]
@@ -351,8 +536,6 @@ mod tests {
         });
         let hooked = with_hooks(inner, hooks);
 
-        // We exercise too_large_result directly via serialized_size path
-        // since constructing a full RequestContext here is impractical.
         let small = CallToolResult::success(vec![Content::text("ok".to_owned())]);
         assert!(serialized_size(&small) < 256);
 
@@ -360,29 +543,34 @@ mod tests {
         let size = serialized_size(&big);
         assert!(size > 256);
 
-        let replaced = too_large_result(256, size, "whatever");
+        let (replaced, accounted, capped) = apply_size_cap(big, Some(256), "whatever");
+        assert!(capped);
+        assert_eq!(accounted, size);
         assert_eq!(replaced.is_error, Some(true));
-        assert!(
-            matches!(&replaced.content[0].raw, rmcp::model::RawContent::Text(t) if t.text.contains("result_too_large"))
-        );
+        assert!(matches!(
+            &replaced.content[0].raw,
+            rmcp::model::RawContent::Text(t) if t.text.contains("result_too_large")
+        ));
 
-        // Ensure HookedHandler compiles with the hooked inner (no runtime
-        // dispatch here, covered by integration).
+        // Compile-check that HookedHandler instantiates with the test inner.
         let _ = hooked;
-        let _ = dummy_ctx();
     }
 
     #[tokio::test]
     async fn before_hook_deny_builds_error() {
         let counter = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&counter);
-        let before: BeforeHook = Arc::new(move |ctx: &ToolCallContext| {
-            c.fetch_add(1, Ordering::Relaxed);
-            if ctx.tool_name == "forbidden" {
-                Err(ToolHookError::Deny("nope".into()))
-            } else {
-                Ok(())
-            }
+        let before: BeforeHook = Arc::new(move |ctx_ref| {
+            let c = Arc::clone(&c);
+            let name = ctx_ref.tool_name.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::Relaxed);
+                if name == "forbidden" {
+                    HookOutcome::Deny(ErrorData::invalid_request("nope", None))
+                } else {
+                    HookOutcome::Continue
+                }
+            })
         });
 
         let hooks = Arc::new(ToolHooks {
@@ -392,20 +580,16 @@ mod tests {
         });
         let hooked = with_hooks(TestHandler::default(), hooks);
 
-        // Just validate the hook closure itself; call_tool integration requires
-        // a real RequestContext, which is covered by the application's tests.
-        let ctx = ToolCallContext {
-            tool_name: "forbidden".into(),
-            arguments: None,
-            identity: None,
-            role: None,
-            sub: None,
-            request_id: None,
-        };
+        let bad_ctx = ctx("forbidden");
         let before_fn = hooked.hooks.before.as_ref().unwrap();
-        let res = before_fn(&ctx);
-        assert!(matches!(res, Err(ToolHookError::Deny(_))));
+        let outcome = before_fn(&bad_ctx).await;
+        assert!(matches!(outcome, HookOutcome::Deny(_)));
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        let ok_ctx = ctx("allowed");
+        let outcome2 = before_fn(&ok_ctx).await;
+        assert!(matches!(outcome2, HookOutcome::Continue));
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -416,5 +600,115 @@ mod tests {
         assert!(body.contains("my_tool"));
         assert!(body.contains("100"));
         assert!(body.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn replace_outcome_skips_inner_and_returns_payload() {
+        // Returning Replace from before-hook must yield the supplied
+        // CallToolResult directly, with no need for the inner handler.
+        let before: BeforeHook = Arc::new(|_ctx| {
+            Box::pin(async {
+                HookOutcome::Replace(Box::new(CallToolResult::success(vec![Content::text(
+                    "from-replace".to_owned(),
+                )])))
+            })
+        });
+        let hooks = Arc::new(ToolHooks {
+            max_result_bytes: None,
+            before: Some(before),
+            after: None,
+        });
+        let _hooked = with_hooks(TestHandler::default(), Arc::clone(&hooks));
+
+        // Exercise the before-hook closure + apply_size_cap helper directly,
+        // matching the established test pattern in this module.
+        let outcome = (hooks.before.as_ref().unwrap())(&ctx("any")).await;
+        let HookOutcome::Replace(boxed) = outcome else {
+            panic!("expected HookOutcome::Replace");
+        };
+        let (result, size, capped) = apply_size_cap(*boxed, None, "any");
+        assert!(!capped);
+        assert!(size > 0);
+        assert!(!result.is_error.unwrap_or(false));
+        assert!(matches!(
+            &result.content[0].raw,
+            rmcp::model::RawContent::Text(t) if t.text == "from-replace"
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_outcome_subject_to_size_cap() {
+        // A Replace payload that exceeds max_result_bytes must be rewritten
+        // to result_too_large just like an inner-handler result would be,
+        // and the disposition must reflect ResultTooLarge.
+        let huge = CallToolResult::success(vec![Content::text("y".repeat(8_192))]);
+        let huge_size = serialized_size(&huge);
+        assert!(huge_size > 256);
+
+        let (final_result, accounted, capped) = apply_size_cap(huge, Some(256), "replaced_tool");
+        assert!(capped);
+        assert_eq!(accounted, huge_size);
+        assert_eq!(final_result.is_error, Some(true));
+        assert!(matches!(
+            &final_result.content[0].raw,
+            rmcp::model::RawContent::Text(t) if t.text.contains("result_too_large")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_hook_fires_exactly_once_via_spawn() {
+        // spawn_after must enqueue the after-hook exactly one time per
+        // invocation and never block the caller; we wait for the spawned
+        // task to run by polling the counter with a short timeout.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+        let after: AfterHook = Arc::new(move |_ctx, _disp, _size| {
+            let c = Arc::clone(&c);
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        let holder = Arc::new(AfterHookHolder { f: after });
+
+        HookedHandler::<TestHandler>::spawn_after(
+            Some(&holder),
+            ctx("t"),
+            HookDisposition::InnerExecuted,
+            42,
+        );
+
+        // Wait up to 1s for the spawned task to run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while counter.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_hook_panic_is_isolated_from_response_path() {
+        // A panicking after-hook must not affect the request task.  We
+        // spawn a panicking after-hook and then verify the current task
+        // can still complete an unrelated future to completion.
+        let after: AfterHook = Arc::new(|_ctx, _disp, _size| {
+            Box::pin(async {
+                panic!("intentional panic in after-hook");
+            })
+        });
+        let holder = Arc::new(AfterHookHolder { f: after });
+
+        HookedHandler::<TestHandler>::spawn_after(
+            Some(&holder),
+            ctx("boom"),
+            HookDisposition::InnerExecuted,
+            0,
+        );
+
+        // Give Tokio a chance to run + abort the panicking task, then
+        // confirm we're still alive and the runtime is healthy.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let still_alive = tokio::spawn(async { 1_u32 + 2 }).await.unwrap();
+        assert_eq!(still_alive, 3);
     }
 }

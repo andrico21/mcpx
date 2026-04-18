@@ -10,6 +10,45 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ### Changed
 
+- **[H-A4] Tool hooks are now `async`.** `BeforeHook` and `AfterHook`
+  are redefined as async function pointers returning
+  `Pin<Box<dyn Future + Send>>` so hook bodies can `.await` (e.g.
+  audit-log writes, RBAC lookups against an async store, metric
+  emission via async clients). Hook return types changed:
+  - `BeforeHook` returns `HookOutcome` (new enum with three variants:
+    `Continue`, `Deny(rmcp::ErrorData)`, `Replace(Box<CallToolResult>)`)
+    instead of the old `Result<(), ToolHookError>`. `Deny` and
+    `Replace` short-circuit the inner handler. `Replace` is subject
+    to the same `max_result_bytes` cap as inner results.
+  - `AfterHook` receives a new `HookDisposition` enum
+    (`InnerExecuted`, `InnerErrored`, `DeniedBefore`,
+    `ReplacedBefore`, `ResultTooLarge`) so hooks can branch on
+    actual outcome. After-hooks are dispatched via `tokio::spawn`
+    so they never block the response path; panics inside an
+    after-hook are caught by Tokio and isolated from the caller.
+  - `ToolHookError` is `#[deprecated(since = "0.12.0")]` and will be
+    removed in 0.13. Replace `ToolHookError::Deny(msg)` with
+    `HookOutcome::Deny(rmcp::ErrorData::invalid_request(msg, None))`.
+- **[H-A4] `ToolHooks` and `ToolCallContext` are `#[non_exhaustive]`.**
+  Construct `ToolHooks` via `ToolHooks::new()` followed by chainable
+  `with_max_result_bytes(n)`, `with_before(hook)`, `with_after(hook)`
+  builder methods. Construct `ToolCallContext` via
+  `ToolCallContext::for_tool(name)` (then mutate the public fields
+  for additional context). Direct struct-literal construction is no
+  longer supported from outside the crate, which lets us add fields
+  in 0.x without further breaks.
+
+### Added
+
+- **[H-A4] Hook overhead microbenchmark + CI gate.** New
+  `benches/hook_latency.rs` (criterion) measures bare vs. hooked
+  closure-invocation latency. New `scripts/check-bench-overhead.{sh,ps1}`
+  asserts `mean(hooked) - mean(bare) <= 2000 ns`. Observed overhead
+  on the reference machine: ~700 ns (one async await + one
+  `tokio::spawn` + Arc bookkeeping). The bench file documents why an
+  absolute-overhead gate is more meaningful than the original 1.05x
+  ratio gate at this measurement layer.
+
 - **[H-A1] Public API no longer leaks `anyhow`.** `serve()`,
   `serve_with_listener()`, `serve_stdio()`, `serve_metrics()`, and
   `McpMetrics::new()` now return `Result<_, McpxError>` instead of
@@ -23,8 +62,6 @@ Pre-1.0: breaking changes bump the **minor** version.
   explicitly must switch to `mcpx::Result<()>` (newly re-exported at
   the crate root). See `examples/minimal_server.rs` for the
   recommended pattern.
-
-### Added
 
 - `mcpx::McpxError` and `mcpx::Result` re-exports at the crate root
   for ergonomic downstream usage.

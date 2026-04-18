@@ -110,6 +110,10 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 name = "rbac_redaction"
 harness = false
 
+[[bench]]
+name = "hook_latency"
+harness = false
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Standalone configuration (activated by scripts/extract-mcpx.ps1/sh).

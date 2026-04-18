@@ -961,3 +961,113 @@ async fn validate_rejects_other_misconfig() {
     let err = cfg.validate().expect_err("must reject zero body cap");
     assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("max_request_body")));
 }
+
+// ==========================================================================
+// HookedHandler integration (H-A4)
+// ==========================================================================
+
+/// Spin up a server whose factory wraps `TestHandler` in a
+/// [`mcpx::tool_hooks::HookedHandler`].  This proves the new async hook
+/// types satisfy `serve_with_listener`'s `ServerHandler` bound and that
+/// hook plumbing does not break the basic transport path.
+#[tokio::test]
+async fn hooked_handler_serves_healthz() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use mcpx::tool_hooks::{AfterHook, BeforeHook, HookOutcome, ToolHooks, with_hooks};
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let port = free_port().await;
+    let cfg = config_on_port(port);
+
+    let before_calls = Arc::new(AtomicUsize::new(0));
+    let after_calls = Arc::new(AtomicUsize::new(0));
+    let bc = Arc::clone(&before_calls);
+    let ac = Arc::clone(&after_calls);
+
+    let before: BeforeHook = Arc::new(move |_ctx| {
+        let bc = Arc::clone(&bc);
+        Box::pin(async move {
+            bc.fetch_add(1, Ordering::Relaxed);
+            HookOutcome::Continue
+        })
+    });
+    let after: AfterHook = Arc::new(move |_ctx, _disp, _bytes| {
+        let ac = Arc::clone(&ac);
+        Box::pin(async move {
+            ac.fetch_add(1, Ordering::Relaxed);
+        })
+    });
+
+    let hooks = Arc::new(
+        ToolHooks::new()
+            .with_max_result_bytes(64 * 1024)
+            .with_before(before)
+            .with_after(after),
+    );
+
+    // Custom spawn flow because the standard `spawn_server` factory
+    // returns the bare TestHandler; we need it wrapped in HookedHandler.
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let bound: SocketAddr = listener.local_addr().unwrap();
+    let mut cfg = cfg;
+    cfg.bind_addr = bound.to_string();
+
+    let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+    let shutdown = CancellationToken::new();
+    let shutdown_for_server = shutdown.clone();
+    let hooks_for_factory = Arc::clone(&hooks);
+
+    let join = tokio::spawn(async move {
+        mcpx::transport::serve_with_listener(
+            listener,
+            cfg,
+            move || with_hooks(TestHandler, Arc::clone(&hooks_for_factory)),
+            Some(ready_tx),
+            Some(shutdown_for_server),
+        )
+        .await
+    });
+
+    let _signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("server did not signal readiness within 5s")
+        .expect("server task aborted before readiness signal");
+
+    let resp = reqwest::get(&format!("http://{bound}/healthz"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Hooks haven't fired (no /mcp tools/call traffic), but the server
+    // is alive and the wrapped handler is being served.
+    assert_eq!(before_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(after_calls.load(Ordering::Relaxed), 0);
+
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
+}
+
+/// Constructing all three [`mcpx::tool_hooks::HookOutcome`] variants
+/// must compile and round-trip through the public API.  This guards
+/// against accidental visibility regressions on the new enum during
+/// future refactors.
+#[test]
+fn hook_outcome_variants_are_constructible() {
+    use mcpx::tool_hooks::HookOutcome;
+    use rmcp::{
+        ErrorData,
+        model::{CallToolResult, Content},
+    };
+
+    let _ = HookOutcome::Continue;
+    let _ = HookOutcome::Deny(ErrorData::invalid_request("denied", None));
+    let _ = HookOutcome::Replace(Box::new(CallToolResult::success(vec![Content::text(
+        "x".to_owned(),
+    )])));
+}
