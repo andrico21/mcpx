@@ -61,10 +61,12 @@ impl ServerHandler for MyHandler {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> mcpx::Result<()> {
     let _ = mcpx::observability::init_tracing("info,my_server=debug");
 
-    let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0");
+    let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+        .with_request_timeout(std::time::Duration::from_secs(30))
+        .enable_request_header_logging();
     serve(config, || MyHandler).await
 }
 ```
@@ -143,26 +145,31 @@ Server configuration. All fields have safe defaults except `bind_addr`,
 use mcpx::transport::McpServerConfig;
 use std::time::Duration;
 
-let mut config = McpServerConfig::new("0.0.0.0:8443", "my-server", "1.0.0");
+// Builder style (recommended): chain `with_*` / `enable_*` methods.
+let config = McpServerConfig::new("0.0.0.0:8443", "my-server", "1.0.0")
+    // Optional: TLS (enables HTTPS)
+    .with_tls("/etc/certs/server.crt", "/etc/certs/server.key")
+    // Optional: DNS rebinding protection (MCP spec requirement)
+    .with_allowed_origins([
+        "http://localhost:3000",
+        "https://myapp.example.com",
+    ])
+    // Optional: request limits
+    .with_max_request_body(2 * 1024 * 1024) // 2 MiB
+    .with_request_timeout(Duration::from_secs(60))
+    .with_shutdown_timeout(Duration::from_secs(10))
+    // Optional: per-IP tool rate limiting (calls/minute)
+    .with_tool_rate_limit(60);
 
-// Optional: TLS (enables HTTPS)
-config.tls_cert_path = Some("/etc/certs/server.crt".into());
-config.tls_key_path = Some("/etc/certs/server.key".into());
-
-// Optional: DNS rebinding protection (MCP spec requirement)
-config.allowed_origins = vec![
-    "http://localhost:3000".into(),
-    "https://myapp.example.com".into(),
-];
-
-// Optional: request limits
-config.max_request_body = 2 * 1024 * 1024;  // 2 MiB
-config.request_timeout = Duration::from_secs(60);
-config.shutdown_timeout = Duration::from_secs(10);
-
-// Optional: per-IP tool rate limiting (calls/minute)
-config.tool_rate_limit = Some(60);
+// Validate eagerly to surface misconfiguration before binding.
+// `serve()` and `serve_with_listener()` also call this internally.
+config.validate().expect("config valid");
 ```
+
+> **Note**: Direct field assignment on `McpServerConfig` is still
+> supported (the struct fields remain `pub`), but the builder is the
+> recommended path because it is `#[must_use]`, chainable, and routes
+> through `validate()` automatically when passed to `serve()`.
 
 ##### Fields
 

@@ -38,9 +38,11 @@ impl ServerHandler for MyHandler {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> mcpx::Result<()> {
     let _ = mcpx::observability::init_tracing("info,my_server=debug");
-    let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0");
+    let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+        .with_request_timeout(std::time::Duration::from_secs(30))
+        .enable_request_header_logging();
     serve(config, || MyHandler).await
 }
 ```

@@ -155,6 +155,11 @@ pub struct McpServerConfig {
 impl McpServerConfig {
     /// Create a new server configuration with the given bind address,
     /// server name, and version. All other fields use safe defaults.
+    ///
+    /// Use the chainable `with_*` / `enable_*` builder methods to
+    /// customize. Call [`McpServerConfig::validate`] before passing to
+    /// [`serve`] to surface configuration errors early; [`serve`] and
+    /// [`serve_with_listener`] also invoke `validate()` internally.
     #[must_use]
     pub fn new(
         bind_addr: impl Into<String>,
@@ -191,6 +196,265 @@ impl McpServerConfig {
             #[cfg(feature = "metrics")]
             metrics_bind: "127.0.0.1:9090".into(),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Builder methods (fluent, consume + return self).
+    //
+    // Each method is `#[must_use]` because dropping the returned
+    // `McpServerConfig` discards the configuration change.
+    // ---------------------------------------------------------------
+
+    /// Attach an authentication configuration. Required for
+    /// [`enable_admin`](Self::enable_admin) and any non-public deployment.
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthConfig) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Attach an RBAC policy. Tool calls are checked against the policy
+    /// after authentication.
+    #[must_use]
+    pub fn with_rbac(mut self, rbac: Arc<RbacPolicy>) -> Self {
+        self.rbac = Some(rbac);
+        self
+    }
+
+    /// Configure TLS by providing the certificate and private key paths
+    /// (PEM). Both must be readable at startup. Without this call, the
+    /// server runs plain HTTP.
+    #[must_use]
+    pub fn with_tls(mut self, cert_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
+        self.tls_cert_path = Some(cert_path.into());
+        self.tls_key_path = Some(key_path.into());
+        self
+    }
+
+    /// Set the externally reachable base URL (e.g. `https://mcp.example.com`).
+    /// Required when binding `0.0.0.0` behind a reverse proxy or inside
+    /// a container so OAuth metadata and auto-derived origins resolve correctly.
+    #[must_use]
+    pub fn with_public_url(mut self, url: impl Into<String>) -> Self {
+        self.public_url = Some(url.into());
+        self
+    }
+
+    /// Replace the allowed Origin allow-list (DNS-rebinding protection).
+    /// When empty and [`with_public_url`](Self::with_public_url) is set,
+    /// the origin is auto-derived.
+    #[must_use]
+    pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = origins.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Merge an additional axum router at the top level. Routes added
+    /// here **bypass** mcpx auth and RBAC; the application is responsible
+    /// for its own protection.
+    #[must_use]
+    pub fn with_extra_router(mut self, router: axum::Router) -> Self {
+        self.extra_router = Some(router);
+        self
+    }
+
+    /// Install an async readiness probe for `/readyz`. Without this call,
+    /// `/readyz` mirrors `/healthz` (always 200 OK).
+    #[must_use]
+    pub fn with_readiness_check(mut self, check: ReadinessCheck) -> Self {
+        self.readiness_check = Some(check);
+        self
+    }
+
+    /// Override the maximum request body (bytes). Must be `> 0`.
+    /// Default: 1 MiB.
+    #[must_use]
+    pub fn with_max_request_body(mut self, bytes: usize) -> Self {
+        self.max_request_body = bytes;
+        self
+    }
+
+    /// Override the per-request processing timeout. Default: 2 minutes.
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Override the graceful shutdown grace period. Default: 30 seconds.
+    #[must_use]
+    pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Override the MCP session idle timeout. Default: 20 minutes.
+    #[must_use]
+    pub fn with_session_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.session_idle_timeout = timeout;
+        self
+    }
+
+    /// Override the SSE keep-alive interval. Default: 15 seconds.
+    #[must_use]
+    pub fn with_sse_keep_alive(mut self, interval: Duration) -> Self {
+        self.sse_keep_alive = interval;
+        self
+    }
+
+    /// Cap the global number of in-flight HTTP requests via
+    /// `tower::load_shed`. Excess requests receive 503 Service Unavailable.
+    /// Default: unlimited.
+    #[must_use]
+    pub fn with_max_concurrent_requests(mut self, limit: usize) -> Self {
+        self.max_concurrent_requests = Some(limit);
+        self
+    }
+
+    /// Cap tool invocations per source IP per minute. Enforced on every
+    /// `tools/call` request.
+    #[must_use]
+    pub fn with_tool_rate_limit(mut self, per_minute: u32) -> Self {
+        self.tool_rate_limit = Some(per_minute);
+        self
+    }
+
+    /// Register a callback that receives the [`ReloadHandle`] after the
+    /// server is built. Use it to wire SIGHUP-style hot reloads of API
+    /// keys and RBAC policy.
+    #[must_use]
+    pub fn with_reload_callback<F>(mut self, callback: F) -> Self
+    where
+        F: FnOnce(ReloadHandle) + Send + 'static,
+    {
+        self.on_reload_ready = Some(Box::new(callback));
+        self
+    }
+
+    /// Enable gzip/brotli response compression on MCP responses.
+    /// `min_size` is the smallest body size (bytes) eligible for
+    /// compression. Default min size: 1024.
+    #[must_use]
+    pub fn enable_compression(mut self, min_size: u16) -> Self {
+        self.compression_enabled = true;
+        self.compression_min_size = min_size;
+        self
+    }
+
+    /// Enable `/admin/*` diagnostic endpoints. Requires
+    /// [`with_auth`](Self::with_auth) to be set and enabled; otherwise
+    /// [`validate`](Self::validate) returns an error. `role` is the RBAC
+    /// role gate (default: `"admin"`).
+    #[must_use]
+    pub fn enable_admin(mut self, role: impl Into<String>) -> Self {
+        self.admin_enabled = true;
+        self.admin_role = role.into();
+        self
+    }
+
+    /// Log inbound HTTP request headers at DEBUG level. Sensitive
+    /// values remain redacted by the logging layer.
+    #[must_use]
+    pub fn enable_request_header_logging(mut self) -> Self {
+        self.log_request_headers = true;
+        self
+    }
+
+    /// Enable the Prometheus metrics listener on `bind` (e.g.
+    /// `127.0.0.1:9090`). Requires the `metrics` crate feature.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn with_metrics(mut self, bind: impl Into<String>) -> Self {
+        self.metrics_enabled = true;
+        self.metrics_bind = bind.into();
+        self
+    }
+
+    /// Validate the configuration. Called automatically by [`serve`] and
+    /// [`serve_with_listener`]; callers may invoke it early to surface
+    /// configuration mistakes before binding sockets.
+    ///
+    /// Checks:
+    ///
+    /// 1. `admin_enabled` requires `auth` to be configured and enabled.
+    /// 2. `tls_cert_path` and `tls_key_path` must both be set or both
+    ///    be unset.
+    /// 3. `bind_addr` must parse as a [`SocketAddr`].
+    /// 4. `public_url`, when set, must start with `http://` or `https://`.
+    /// 5. Each entry in `allowed_origins` must start with `http://` or
+    ///    `https://`.
+    /// 6. `max_request_body` must be greater than zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpxError::Config`] with a human-readable message on
+    /// the first validation failure.
+    pub fn validate(&self) -> Result<(), McpxError> {
+        // 1. admin <-> auth dependency. Mirrors the runtime check in
+        //    `build_app_router`: admin endpoints require an auth state,
+        //    which is built only when `auth` is `Some` *and* `enabled`.
+        if self.admin_enabled {
+            let auth_enabled = self.auth.as_ref().is_some_and(|a| a.enabled);
+            if !auth_enabled {
+                return Err(McpxError::Config(
+                    "admin_enabled=true requires auth to be configured and enabled".into(),
+                ));
+            }
+        }
+
+        // 2. TLS cert / key must be paired
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(_), None) => {
+                return Err(McpxError::Config(
+                    "tls_cert_path is set but tls_key_path is missing".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(McpxError::Config(
+                    "tls_key_path is set but tls_cert_path is missing".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        // 3. bind_addr parses
+        if self.bind_addr.parse::<SocketAddr>().is_err() {
+            return Err(McpxError::Config(format!(
+                "bind_addr {:?} is not a valid socket address (expected e.g. 127.0.0.1:8080)",
+                self.bind_addr
+            )));
+        }
+
+        // 4. public_url scheme
+        if let Some(ref url) = self.public_url
+            && !(url.starts_with("http://") || url.starts_with("https://"))
+        {
+            return Err(McpxError::Config(format!(
+                "public_url {url:?} must start with http:// or https://"
+            )));
+        }
+
+        // 5. allowed_origins scheme
+        for origin in &self.allowed_origins {
+            if !(origin.starts_with("http://") || origin.starts_with("https://")) {
+                return Err(McpxError::Config(format!(
+                    "allowed_origins entry {origin:?} must start with http:// or https://"
+                )));
+            }
+        }
+
+        // 6. max_request_body > 0
+        if self.max_request_body == 0 {
+            return Err(McpxError::Config(
+                "max_request_body must be greater than zero".into(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -742,6 +1006,7 @@ where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
+    config.validate()?;
     let bind_addr = config.bind_addr.clone();
     let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
 
@@ -802,6 +1067,7 @@ where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
+    config.validate()?;
     let local_addr = listener
         .local_addr()
         .map_err(|e| io_to_startup("listener.local_addr", e))?;

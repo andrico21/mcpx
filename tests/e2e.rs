@@ -816,3 +816,148 @@ async fn shutdown_timeout_honored_on_first_signal() {
         "shutdown took {elapsed:?}, expected < 1500ms (BUG-NEW regression)"
     );
 }
+
+// ==========================================================================
+// H-A2: McpServerConfig builder + validate()
+// ==========================================================================
+
+/// Builder methods produce the same effective config as direct field
+/// assignment. Asserts a representative subset of fields touched by
+/// every common builder so future drift surfaces here first.
+#[tokio::test]
+async fn builder_matches_direct_field_assignment() {
+    let port = free_port().await;
+    let bind = format!("127.0.0.1:{port}");
+
+    let manual = {
+        let mut cfg = McpServerConfig::new(&bind, "test", "0.0.1");
+        cfg.allowed_origins = vec!["http://localhost:3000".into()];
+        cfg.public_url = Some("http://example.com".into());
+        cfg.max_request_body = 4096;
+        cfg.request_timeout = Duration::from_secs(7);
+        cfg.shutdown_timeout = Duration::from_secs(11);
+        cfg.session_idle_timeout = Duration::from_mins(2);
+        cfg.sse_keep_alive = Duration::from_secs(3);
+        cfg.tool_rate_limit = Some(42);
+        cfg.max_concurrent_requests = Some(99);
+        cfg.compression_enabled = true;
+        cfg.compression_min_size = 256;
+        cfg.log_request_headers = true;
+        cfg.admin_enabled = false;
+        cfg.admin_role = "ops".to_owned();
+        cfg
+    };
+
+    let built = McpServerConfig::new(&bind, "test", "0.0.1")
+        .with_allowed_origins(["http://localhost:3000"])
+        .with_public_url("http://example.com")
+        .with_max_request_body(4096)
+        .with_request_timeout(Duration::from_secs(7))
+        .with_shutdown_timeout(Duration::from_secs(11))
+        .with_session_idle_timeout(Duration::from_mins(2))
+        .with_sse_keep_alive(Duration::from_secs(3))
+        .with_tool_rate_limit(42)
+        .with_max_concurrent_requests(99)
+        .enable_compression(256)
+        .enable_request_header_logging()
+        .enable_admin("ops");
+    // `enable_admin` flips admin_enabled=true; manual leaves it false.
+    // Compare every other field; admin_enabled is asserted separately.
+    assert_eq!(manual.bind_addr, built.bind_addr);
+    assert_eq!(manual.allowed_origins, built.allowed_origins);
+    assert_eq!(manual.public_url, built.public_url);
+    assert_eq!(manual.max_request_body, built.max_request_body);
+    assert_eq!(manual.request_timeout, built.request_timeout);
+    assert_eq!(manual.shutdown_timeout, built.shutdown_timeout);
+    assert_eq!(manual.session_idle_timeout, built.session_idle_timeout);
+    assert_eq!(manual.sse_keep_alive, built.sse_keep_alive);
+    assert_eq!(manual.tool_rate_limit, built.tool_rate_limit);
+    assert_eq!(
+        manual.max_concurrent_requests,
+        built.max_concurrent_requests
+    );
+    assert_eq!(manual.compression_enabled, built.compression_enabled);
+    assert_eq!(manual.compression_min_size, built.compression_min_size);
+    assert_eq!(manual.log_request_headers, built.log_request_headers);
+    assert_eq!(manual.admin_role, built.admin_role);
+    assert!(built.admin_enabled, "enable_admin should set the flag");
+    assert!(
+        manual.validate().is_ok(),
+        "manual config must validate cleanly"
+    );
+}
+
+/// `enable_admin` without a corresponding `with_auth(...).enabled = true`
+/// must be rejected by `validate()` as `McpxError::Config`. This mirrors
+/// the previous runtime check and prevents accidentally exposing
+/// `/admin/*` without authentication.
+#[tokio::test]
+async fn validate_rejects_admin_without_auth() {
+    let cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1").enable_admin("admin");
+    let err = cfg.validate().expect_err("must reject admin without auth");
+    assert!(
+        matches!(err, mcpx::McpxError::Config(ref msg) if msg.contains("admin")),
+        "expected McpxError::Config mentioning admin, got: {err}"
+    );
+
+    // serve() must surface the same error early, before binding.
+    let res = mcpx::transport::serve(
+        McpServerConfig::new("127.0.0.1:0", "test", "0.0.1").enable_admin("admin"),
+        || TestHandler,
+    )
+    .await;
+    assert!(matches!(res, Err(mcpx::McpxError::Config(_))));
+}
+
+/// Setting only the TLS cert (or only the key) must be rejected by
+/// `validate()`. Both paths must be present together or absent together.
+#[tokio::test]
+async fn validate_rejects_partial_tls_pair() {
+    let mut cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1");
+    cfg.tls_cert_path = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+    let err = cfg
+        .validate()
+        .expect_err("cert without key must be rejected");
+    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("tls_key_path")));
+
+    let mut cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1");
+    cfg.tls_key_path = Some(std::path::PathBuf::from("/tmp/key.pem"));
+    let err = cfg
+        .validate()
+        .expect_err("key without cert must be rejected");
+    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("tls_cert_path")));
+
+    // Both set together: only the *file existence* matters at startup,
+    // not validate() -- so this should pass validation.
+    let cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1")
+        .with_tls("/tmp/cert.pem", "/tmp/key.pem");
+    cfg.validate().expect("paired cert+key must validate");
+}
+
+/// Bad `bind_addr` / `public_url` / origin / zero body cap must each be
+/// rejected with a descriptive `McpxError::Config`.
+#[tokio::test]
+async fn validate_rejects_other_misconfig() {
+    // Unparseable bind_addr
+    let cfg = McpServerConfig::new("not-a-socket-addr", "t", "0");
+    let err = cfg.validate().expect_err("must reject bad bind_addr");
+    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("bind_addr")));
+
+    // public_url without scheme
+    let cfg =
+        McpServerConfig::new("127.0.0.1:0", "t", "0").with_public_url("example.com/no-scheme");
+    let err = cfg
+        .validate()
+        .expect_err("must reject schemeless public_url");
+    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("public_url")));
+
+    // origin without scheme
+    let cfg = McpServerConfig::new("127.0.0.1:0", "t", "0").with_allowed_origins(["localhost"]);
+    let err = cfg.validate().expect_err("must reject schemeless origin");
+    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("allowed_origins")));
+
+    // zero body cap
+    let cfg = McpServerConfig::new("127.0.0.1:0", "t", "0").with_max_request_body(0);
+    let err = cfg.validate().expect_err("must reject zero body cap");
+    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("max_request_body")));
+}

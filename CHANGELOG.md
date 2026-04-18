@@ -28,6 +28,24 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 - `mcpx::McpxError` and `mcpx::Result` re-exports at the crate root
   for ergonomic downstream usage.
+- **[H-A2] Fluent builder + `validate()` on `McpServerConfig`.** The
+  configuration struct now exposes ~18 chainable, `#[must_use]`
+  builder methods (`with_auth`, `with_rbac`, `with_tls`,
+  `with_public_url`, `with_allowed_origins`, `with_extra_router`,
+  `with_readiness_check`, `with_max_request_body`,
+  `with_request_timeout`, `with_shutdown_timeout`,
+  `with_session_idle_timeout`, `with_sse_keep_alive`,
+  `with_max_concurrent_requests`, `with_tool_rate_limit`,
+  `with_reload_callback`, `enable_compression`, `enable_admin`,
+  `enable_request_header_logging`, plus `with_metrics` under
+  `feature = "metrics"`). A new `validate(&self) -> Result<(), McpxError>`
+  method centralizes six pre-flight checks (admin↔auth dependency,
+  TLS cert/key pairing, parseable `bind_addr`, well-formed
+  `public_url` and `allowed_origins`, non-zero `max_request_body`)
+  and is invoked automatically by `serve()` and
+  `serve_with_listener()`. Existing direct-field-assignment call
+  sites continue to compile unchanged (additive, non-breaking).
+  See `examples/minimal_server.rs` for the recommended pattern.
 - **[H-A3] Ergonomic `BoundedKeyedLimiter` constructors.** New
   `BoundedKeyedLimiter::with_per_minute(rpm, max_keys, idle)` and
   `with_per_second(rps, max_keys, idle)` build the per-key

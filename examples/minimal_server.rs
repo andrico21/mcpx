@@ -44,7 +44,9 @@ async fn main() -> mcpx::Result<()> {
         "127.0.0.1:8080",
         "mcpx-minimal-example",
         env!("CARGO_PKG_VERSION"),
-    );
+    )
+    .with_request_timeout(std::time::Duration::from_secs(30))
+    .enable_request_header_logging();
 
     serve(config, || MinimalHandler).await
 }
