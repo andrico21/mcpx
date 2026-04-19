@@ -71,6 +71,7 @@ pub enum AuthMethod {
 enum AuthFailureClass {
     MissingCredential,
     InvalidCredential,
+    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
     ExpiredCredential,
     /// Source IP exceeded the post-failure backoff limit.
     RateLimited,
@@ -749,6 +750,7 @@ fn auth_method_label(method: AuthMethod) -> &'static str {
     }
 }
 
+#[cfg_attr(not(feature = "oauth"), allow(unused_variables))]
 fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> Response {
     #[cfg(feature = "oauth")]
     let advertise_resource_metadata = state.jwks_cache.is_some();
