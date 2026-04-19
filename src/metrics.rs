@@ -9,7 +9,7 @@
 //! [`crate::metrics::McpMetrics::registry`] and the `IntCounterVec` / `HistogramVec` fields are
 //! intentionally exposed so downstream crates can register additional custom
 //! collectors against the same registry. This re-exports the [`prometheus`]
-//! crate types as part of `mcpx`'s public API; pin the same major version to
+//! crate types as part of `rmcp-server-kit`'s public API; pin the same major version to
 //! avoid type-identity mismatches when registering custom metrics.
 
 use std::sync::Arc;
@@ -43,7 +43,7 @@ impl McpMetrics {
         let registry = Registry::new();
 
         let http_requests_total = IntCounterVec::new(
-            opts!("mcpx_http_requests_total", "Total HTTP requests"),
+            opts!("rmcp_server_kit_http_requests_total", "Total HTTP requests"),
             &["method", "path", "status"],
         )
         .map_err(|e| McpxError::Metrics(e.to_string()))?;
@@ -53,7 +53,7 @@ impl McpMetrics {
 
         let http_request_duration_seconds = HistogramVec::new(
             histogram_opts!(
-                "mcpx_http_request_duration_seconds",
+                "rmcp_server_kit_http_request_duration_seconds",
                 "HTTP request duration in seconds"
             ),
             &["method", "path"],
@@ -142,7 +142,7 @@ mod tests {
         let m = McpMetrics::new().unwrap();
         let output = m.encode();
         // Empty counters/histograms produce no samples but the output is valid.
-        assert!(output.is_empty() || output.contains("mcpx_"));
+        assert!(output.is_empty() || output.contains("rmcp_server_kit_"));
     }
 
     #[test]
@@ -152,7 +152,7 @@ mod tests {
             .with_label_values(&["GET", "/healthz", "200"])
             .inc();
         let output = m.encode();
-        assert!(output.contains("mcpx_http_requests_total"));
+        assert!(output.contains("rmcp_server_kit_http_requests_total"));
         assert!(output.contains("method=\"GET\""));
         assert!(output.contains("path=\"/healthz\""));
         assert!(output.contains("status=\"200\""));
@@ -166,7 +166,7 @@ mod tests {
             .with_label_values(&["POST", "/mcp"])
             .observe(0.042);
         let output = m.encode();
-        assert!(output.contains("mcpx_http_request_duration_seconds"));
+        assert!(output.contains("rmcp_server_kit_http_request_duration_seconds"));
         assert!(output.contains("method=\"POST\""));
         assert!(output.contains("path=\"/mcp\""));
     }

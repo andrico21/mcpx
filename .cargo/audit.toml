@@ -1,8 +1,8 @@
 [advisories]
 # RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa` 0.9.x. No upstream
-# fix. mcpx validates JWTs with public keys only and never decrypts RSA
+# fix. rmcp-server-kit validates JWTs with public keys only and never decrypts RSA
 # payloads, so this timing sidechannel does not apply.
 #
 # RUSTSEC-2026-0097: `rand` 0.8.5 unsoundness when a custom global logger
-# is installed. mcpx does not install a custom logger for the rand crate.
+# is installed. rmcp-server-kit does not install a custom logger for the rand crate.
 ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0097"]

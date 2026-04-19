@@ -12,12 +12,12 @@
     )
 )]
 
-//! `mcpx` - reusable MCP server framework.
+//! `rmcp-server-kit` - reusable MCP server framework.
 //!
 //! Provides Streamable-HTTP transport with TLS/mTLS, health endpoints,
 //! structured observability (tracing + JSON logs + audit file),
 //! authentication (Bearer/mTLS/OAuth 2.1 JWT), RBAC, and rate limiting.
-//! Application crates depend on `mcpx` and supply their own `ServerHandler`
+//! Application crates depend on `rmcp-server-kit` and supply their own `ServerHandler`
 //! implementation.
 
 /// Reusable server and observability configuration primitives.
@@ -55,5 +55,5 @@ pub mod oauth;
 pub mod metrics;
 
 // Re-export the canonical error types at the crate root for ergonomic
-// `mcpx::Result<()>` / `mcpx::McpxError` usage in downstream crates.
+// `rmcp_server_kit::Result<()>` / `rmcp_server_kit::McpxError` usage in downstream crates.
 pub use crate::error::{McpxError, Result};

@@ -123,7 +123,7 @@ counter.update(Ordering::AcqRel, Ordering::Acquire, |n| n.saturating_add(1));
 ```
 
 **Relevant targets in this workspace:** any CAS loop in
-[mcpx/src/metrics.rs](../mcpx/src/metrics.rs) or auth middleware. Prefer
+[`src/metrics.rs`](../src/metrics.rs) or auth middleware. Prefer
 `update` / `try_update` when touching those paths.
 
 ### 2.3 `core::hint::cold_path()`

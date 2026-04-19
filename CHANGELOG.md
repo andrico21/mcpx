@@ -1,12 +1,38 @@
 # Changelog
 
-All notable changes to `mcpx` are documented in this file.
+All notable changes to `rmcp-server-kit` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Pre-1.0: breaking changes bump the **minor** version.
+Starting with `1.0.0`, breaking changes bump the **major** version. Pre-1.0
+releases (`0.x.y`) used the convention that breaking changes bumped the
+**minor** version.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-04-19
+
+- **Renamed crate from `mcpx` to `rmcp-server-kit`** (the `mcpx` name on crates.io was already taken by an unrelated project). Library import path is now `use rmcp_server_kit::...`. The `mcpx` GitHub repository name is unchanged.
+
+First stable release. **No API changes versus `1.0.0-rc1`** — this
+release promotes the RC to stable after the soak window.
+
+From here, `rmcp-server-kit` follows standard Semantic Versioning:
+
+- **MAJOR** (`2.0.0`) for breaking API changes.
+- **MINOR** (`1.1.0`) for backwards-compatible feature additions.
+- **PATCH** (`1.0.1`) for backwards-compatible bug fixes.
+
+The pre-1.0 convention "breaking changes bump the **minor** version" no
+longer applies.
+
+### Soak items still tracked for future minor releases
+
+- `OauthHttpClient::builder()` for advanced reqwest configuration.
+- mTLS client cert in token exchange.
+- `HttpClient` trait for swappable HTTP backends.
+- Demoting `McpServerConfig` direct fields from `#[deprecated] pub` to
+  `pub(crate)` (would be a `2.0.0` change).
 
 ## [1.0.0-rc1] - 2026-04-19
 
@@ -54,14 +80,14 @@ API changes versus this RC.
   `oauth::handle_revoke`, and `oauth::exchange_token` now accept
   `&oauth::OauthHttpClient` (a thin wrapper around the underlying HTTP
   backend) instead of leaking `reqwest::Client` through the public API.
-  This decouples downstream crates from the `reqwest` version mcpx
+  This decouples downstream crates from the `reqwest` version rmcp-server-kit
   pins. Construct via `OauthHttpClient::new()` (10s connect / 30s
   total timeout). The wrapper is `Clone` (cheap, refcounted) and
   `Debug` (opaque). Internally, `install_oauth_proxy_routes` now
   builds one shared client and clones it across `/token`,
   `/introspect`, and `/revoke` instead of constructing three
   independent pools. **Migration**: replace
-  `reqwest::Client::new()` with `mcpx::oauth::OauthHttpClient::new()?`
+  `reqwest::Client::new()` with `rmcp_server_kit::oauth::OauthHttpClient::new()?`
   at OAuth proxy / token-exchange call sites.
 
 ### Deprecated
@@ -138,11 +164,11 @@ API changes versus this RC.
   **removed**. Most call sites that propagate via `?` into
   `anyhow::Result<()>` will keep compiling because `McpxError` impls
   `std::error::Error`. Call sites that name the return type
-  explicitly must switch to `mcpx::Result<()>` (newly re-exported at
+  explicitly must switch to `rmcp_server_kit::Result<()>` (newly re-exported at
   the crate root). See `examples/minimal_server.rs` for the
   recommended pattern.
 
-- `mcpx::McpxError` and `mcpx::Result` re-exports at the crate root
+- `rmcp_server_kit::McpxError` and `rmcp_server_kit::Result` re-exports at the crate root
   for ergonomic downstream usage.
 - **[H-A2] Fluent builder + `validate()` on `McpServerConfig`.** The
   configuration struct now exposes ~18 chainable, `#[must_use]`
@@ -198,7 +224,7 @@ API changes versus this RC.
 
 Operational hardening release. Closes the nine high-priority items from
 the 1.0 release-readiness audit (BUG-NEW, H-S1-S4, H-T1-T4) and pushes
-mcpx significantly closer to a 1.0-rc candidate. The next release
+rmcp-server-kit significantly closer to a 1.0-rc candidate. The next release
 (0.12.0) will focus on the remaining public-API surface concerns
 (error types, async hooks, `pub(crate)` demotion sweep).
 
@@ -230,7 +256,7 @@ diagnostics. See "Changed" / "Removed" below for migration notes.
   the identity from deny logs; the identity is now passed in
   explicitly.
 - **[H-S4] mTLS revocation guidance.** `SECURITY.md` now loudly
-  documents that mcpx does NOT validate CRL or OCSP for client
+  documents that rmcp-server-kit does NOT validate CRL or OCSP for client
   certificates and points operators at supported workflows
   (cert-manager, Vault PKI, Smallstep step-ca with <=24h cert
   lifetimes, plus CA-rotation and network-layer enforcement).
@@ -238,7 +264,7 @@ diagnostics. See "Changed" / "Removed" below for migration notes.
   grep assertions ensure the guidance cannot silently disappear.
 - **[H-T3] Memory-bounded rate limiters.** Both the per-IP auth limiter
   and the per-tool RBAC limiter now use a new
-  `mcpx::bounded_limiter::BoundedKeyedLimiter<K>` with explicit LRU
+  `rmcp_server_kit::bounded_limiter::BoundedKeyedLimiter<K>` with explicit LRU
   eviction (default cap: 10_000 keys, default idle eviction: 1h). A
   high-cardinality attacker can no longer exhaust server memory by
   cycling through a million spoofed source IPs. New
@@ -248,7 +274,7 @@ diagnostics. See "Changed" / "Removed" below for migration notes.
 
 ### Added
 
-- `mcpx::bounded_limiter` module exposing
+- `rmcp_server_kit::bounded_limiter` module exposing
   `BoundedKeyedLimiter<K>`, `BoundedLimiterError` (with
   `#[non_exhaustive]` `RateLimited` variant), and
   `BoundedLimiterConfig`.
@@ -258,10 +284,10 @@ diagnostics. See "Changed" / "Removed" below for migration notes.
   builder methods (H-T3).
 - `RbacConfig::redaction_salt: Option<SecretString>` and
   `RbacPolicy::redact_arg(value: &str) -> String` (H-S3).
-- `mcpx::auth::build_rate_limiter_with_bounds` and
-  `mcpx::rbac::build_tool_rate_limiter_with_bounds` constructors that
+- `rmcp_server_kit::auth::build_rate_limiter_with_bounds` and
+  `rmcp_server_kit::rbac::build_tool_rate_limiter_with_bounds` constructors that
   accept explicit eviction parameters (H-T3).
-- Deterministic E2E harness: `mcpx::transport::ServerHarness` with
+- Deterministic E2E harness: `rmcp_server_kit::transport::ServerHarness` with
   `bind`/`router_for_tests`/readiness oneshot enabling tests to bind on
   port 0 and observe ready-state without polling (H-T1).
 - `criterion = "0.5"` (dev-dependency, `cargo_bench_support` only) and
@@ -277,7 +303,7 @@ diagnostics. See "Changed" / "Removed" below for migration notes.
 
 ### Changed
 
-- **BREAKING**: `mcpx::observability::init_tracing` and
+- **BREAKING**: `rmcp_server_kit::observability::init_tracing` and
   `init_tracing_from_config` now return
   `Result<(), tracing_subscriber::util::TryInitError>` instead of
   panicking on the second call. The function remains callable from
@@ -371,7 +397,7 @@ types.
     and `/introspect` / `/revoke` return 404.
   - `c3_admin_endpoints_exposed_when_enabled` - metadata advertises
     endpoints and they are mounted when opted in.
-- New public type `mcpx::transport::AuthenticatedTlsStream` with
+- New public type `rmcp_server_kit::transport::AuthenticatedTlsStream` with
   `identity(&self) -> Option<&AuthIdentity>`.
 
 ### Changed

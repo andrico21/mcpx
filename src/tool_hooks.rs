@@ -16,12 +16,12 @@
 //!   The cap applies both to inner-handler results and to
 //!   [`HookOutcome::Replace`](crate::tool_hooks::HookOutcome::Replace) payloads.
 //!
-//! This is entirely **opt-in** at the application layer - `mcpx::serve()`
+//! This is entirely **opt-in** at the application layer - `rmcp_server_kit::serve()`
 //! does not wrap handlers automatically.  Applications that want hooks do:
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use mcpx::tool_hooks::{HookedHandler, HookOutcome, ToolHooks, with_hooks};
+//! use rmcp_server_kit::tool_hooks::{HookedHandler, HookOutcome, ToolHooks, with_hooks};
 //!
 //! # #[derive(Clone, Default)]
 //! # struct MyHandler;

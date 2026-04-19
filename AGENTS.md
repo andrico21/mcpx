@@ -1,6 +1,6 @@
 # AGENTS.md — mcpx
 
-> **Audience**: AI coding agents (and humans) working on the `mcpx` crate.
+> **Audience**: AI coding agents (and humans) working on the `rmcp-server-kit` crate.
 > **Purpose**: Single source of truth for navigating, building, testing, and
 > safely modifying this repository. Read this BEFORE making changes.
 >
@@ -12,13 +12,13 @@
 
 ---
 
-## 1. What is `mcpx`?
+## 1. What is `rmcp-server-kit`?
 
-`mcpx` is a **production-grade reusable Rust framework for building
+`rmcp-server-kit` is a **production-grade reusable Rust framework for building
 [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) servers.**
 
 Consumers supply an `rmcp::handler::server::ServerHandler` implementation;
-`mcpx` provides everything else: HTTP transport, TLS/mTLS, authentication
+`rmcp-server-kit` provides everything else: HTTP transport, TLS/mTLS, authentication
 (API key / mTLS / OAuth 2.1 JWT), RBAC with per-tool argument allowlists,
 per-IP rate limiting, OWASP-grade security headers, structured
 observability, optional Prometheus metrics, admin diagnostics, and graceful
@@ -26,15 +26,15 @@ shutdown.
 
 | Field         | Value                                                              |
 |---------------|--------------------------------------------------------------------|
-| Crate name    | `mcpx`                                                             |
-| Version       | `0.9.30` (see [`Cargo.toml`](Cargo.toml))                          |
+| Crate name    | `rmcp-server-kit`                                                  |
+| Version       | `1.0.0` (see [`Cargo.toml`](Cargo.toml))                          |
 | Edition       | `2024`                                                             |
 | MSRV          | Rust **1.95.0**                                                    |
 | License       | `MIT OR Apache-2.0` (dual)                                         |
 | Crate type    | **Library** (no `src/main.rs`; runnable code lives in `examples/`) |
 | Repository    | https://github.com/andrico21/mcpx (canonical)                      |
 | Mirror        | [REDACTED]                  |
-| Crates.io     | https://crates.io/crates/mcpx                                      |
+| Crates.io     | https://crates.io/crates/rmcp-server-kit                           |
 
 ---
 
@@ -140,7 +140,7 @@ Z:\TempPersistent\mcpx\
 
 ## 5. Entry points (where to start reading)
 
-There is **no** `src/main.rs`. mcpx is a **library**; runnable code is in
+There is **no** `src/main.rs`. rmcp-server-kit is a **library**; runnable code is in
 consumer applications and `examples/`.
 
 | Entry                                    | File                                                                  | Notes                                                                                                  |
@@ -314,7 +314,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — every type, module, file:line reference
 - [`docs/MINDMAP.md`](docs/MINDMAP.md) — mermaid mindmap diagram
-- [`docs/GUIDE.md`](docs/GUIDE.md) — how end-users configure and consume mcpx
+- [`docs/GUIDE.md`](docs/GUIDE.md) — how end-users configure and consume rmcp-server-kit
 - [`docs/RUST_1_95_NOTES.md`](docs/RUST_1_95_NOTES.md) — Rust 1.95 idioms used here
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) — version-migration notes
 - [`docs/RELEASING.md`](docs/RELEASING.md) — release process

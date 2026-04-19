@@ -18,7 +18,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use mcpx::rbac::{RbacConfig, RbacPolicy};
+use rmcp_server_kit::rbac::{RbacConfig, RbacPolicy};
 
 fn bench_redact_arg(c: &mut Criterion) {
     let policy = RbacPolicy::new(&RbacConfig::default());

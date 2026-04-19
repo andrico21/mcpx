@@ -272,7 +272,7 @@ pub struct McpServerConfig {
 /// # Example
 ///
 /// ```no_run
-/// use mcpx::transport::{McpServerConfig, Validated, serve};
+/// use rmcp_server_kit::transport::{McpServerConfig, Validated, serve};
 /// use rmcp::handler::server::ServerHandler;
 /// use rmcp::model::{ServerCapabilities, ServerInfo};
 ///
@@ -284,7 +284,7 @@ pub struct McpServerConfig {
 ///     }
 /// }
 ///
-/// # async fn example() -> mcpx::Result<()> {
+/// # async fn example() -> rmcp_server_kit::Result<()> {
 /// let config: Validated<McpServerConfig> =
 ///     McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0").validate()?;
 /// serve(config, || H).await
@@ -294,7 +294,7 @@ pub struct McpServerConfig {
 /// Forgetting `.validate()?` is a compile error:
 ///
 /// ```compile_fail
-/// use mcpx::transport::{McpServerConfig, serve};
+/// use rmcp_server_kit::transport::{McpServerConfig, serve};
 /// use rmcp::handler::server::ServerHandler;
 /// use rmcp::model::{ServerCapabilities, ServerInfo};
 ///
@@ -306,7 +306,7 @@ pub struct McpServerConfig {
 ///     }
 /// }
 ///
-/// # async fn example() -> mcpx::Result<()> {
+/// # async fn example() -> rmcp_server_kit::Result<()> {
 /// let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0");
 /// // Missing `.validate()?` -> mismatched types: expected
 /// // `Validated<McpServerConfig>`, found `McpServerConfig`.
@@ -465,7 +465,7 @@ impl McpServerConfig {
     }
 
     /// Merge an additional axum router at the top level. Routes added
-    /// here **bypass** mcpx auth and RBAC; the application is responsible
+    /// here **bypass** rmcp-server-kit auth and RBAC; the application is responsible
     /// for its own protection.
     #[must_use]
     pub fn with_extra_router(mut self, router: axum::Router) -> Self {

@@ -376,7 +376,7 @@ pub struct OAuthProxyConfig {
     /// MCP auth middleware) and proxy directly to the upstream `IdP`. If
     /// enabled, you are responsible for restricting access at the
     /// network boundary (firewall, reverse proxy, mTLS) or by routing
-    /// the entire mcpx process behind an authenticated ingress. Leaving
+    /// the entire rmcp-server-kit process behind an authenticated ingress. Leaving
     /// this `false` (the default) makes the endpoints return 404.
     #[serde(default)]
     pub expose_admin_endpoints: bool,

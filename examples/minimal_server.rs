@@ -1,4 +1,4 @@
-//! Minimal mcpx server example.
+//! Minimal rmcp-server-kit server example.
 //!
 //! The smallest working MCP server: Streamable HTTP transport, health
 //! endpoints, and the default `ServerHandler`. Add tools by implementing
@@ -18,11 +18,11 @@
 //! curl http://127.0.0.1:8080/readyz
 //! ```
 
-use mcpx::transport::{McpServerConfig, serve};
 use rmcp::{
     handler::server::ServerHandler,
     model::{ServerCapabilities, ServerInfo},
 };
+use rmcp_server_kit::transport::{McpServerConfig, serve};
 
 #[derive(Clone)]
 struct MinimalHandler;
@@ -34,15 +34,15 @@ impl ServerHandler for MinimalHandler {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> mcpx::Result<()> {
+async fn main() -> rmcp_server_kit::Result<()> {
     // Ignore the error: the only failure mode is "a global tracing
     // subscriber was already installed", which is harmless for an example
     // that owns the entire process.
-    let _ = mcpx::observability::init_tracing("info,mcpx=debug");
+    let _ = rmcp_server_kit::observability::init_tracing("info,rmcp_server_kit=debug");
 
     let config = McpServerConfig::new(
         "127.0.0.1:8080",
-        "mcpx-minimal-example",
+        "rmcp-server-kit-minimal-example",
         env!("CARGO_PKG_VERSION"),
     )
     .with_request_timeout(std::time::Duration::from_secs(30))

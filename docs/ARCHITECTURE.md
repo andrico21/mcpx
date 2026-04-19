@@ -1,6 +1,6 @@
-# mcpx Architecture
+# rmcp-server-kit Architecture
 
-> **Audience**: AI agents and engineers who need to **modify** mcpx safely.
+> **Audience**: AI agents and engineers who need to **modify** rmcp-server-kit safely.
 > **Companion**: [`MINDMAP.md`](MINDMAP.md) for the visual view, [`../AGENTS.md`](../AGENTS.md) for the navigation hub, [`GUIDE.md`](GUIDE.md) for end-user usage.
 >
 > All file references use `file:line` against the working tree as of v0.12.0.
@@ -34,12 +34,12 @@
 
 ## 1. Bird's-eye view
 
-`mcpx` is a **library crate** providing a "batteries included" framework
+`rmcp-server-kit` is a **library crate** providing a "batteries included" framework
 around the MCP Streamable HTTP transport from the official Rust SDK
 ([`rmcp`](https://docs.rs/rmcp)). The consumer's job is to implement
-`rmcp::handler::server::ServerHandler` and call `mcpx::transport::serve()`.
+`rmcp::handler::server::ServerHandler` and call `rmcp_server_kit::transport::serve()`.
 Everything below the `serve()` call — listeners, TLS, middleware, auth,
-RBAC, hooks, observability, metrics, admin endpoints — is mcpx's
+RBAC, hooks, observability, metrics, admin endpoints — is rmcp-server-kit's
 responsibility.
 
 The crate has two transports:
@@ -409,7 +409,7 @@ deployments, TLS is strongly recommended.
 4. Builds `AuthIdentity { method: OAuth, role, sub, raw_token: Some(_), … }`.
 
 ### Optional OAuth 2.1 proxy
-When `oauth.proxy` is configured, mcpx mounts thin proxy endpoints under
+When `oauth.proxy` is configured, rmcp-server-kit mounts thin proxy endpoints under
 the server's own URL (`src/transport.rs:1214-1230`):
 - `/.well-known/oauth-authorization-server`
 - `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`
@@ -481,7 +481,7 @@ Useful for debugging hot-reload state and verifying RBAC after a swap.
 - optional **audit-file sink** (`src/observability.rs:133-180`) — appends
   structured JSON events to a path; useful for compliance/forensics.
 
-Conventions used by mcpx itself:
+Conventions used by rmcp-server-kit itself:
 - `tracing::info!` for lifecycle events (server up/down, key reloads)
 - `tracing::warn!` for soft denials (rate-limit hits, RBAC denies)
 - `tracing::error!` for hard failures (TLS handshake errors, internal panics caught by axum)
@@ -499,11 +499,11 @@ Conventions used by mcpx itself:
 
 `McpMetrics` (`src/metrics.rs:26-93`) wraps a `prometheus::Registry` and
 records standard server metrics:
-- `mcpx_requests_total{path, status}` (counter)
-- `mcpx_request_duration_seconds{path}` (histogram)
-- `mcpx_inflight_requests` (gauge)
-- `mcpx_auth_failures_total{method}` (counter)
-- `mcpx_rbac_denies_total{role, tool}` (counter)
+- `rmcp_server_kit_requests_total{path, status}` (counter)
+- `rmcp_server_kit_request_duration_seconds{path}` (histogram)
+- `rmcp_server_kit_inflight_requests` (gauge)
+- `rmcp_server_kit_auth_failures_total{method}` (counter)
+- `rmcp_server_kit_rbac_denies_total{role, tool}` (counter)
 
 The `/metrics` endpoint is served on a **separate listener** (often a
 private bind address) configured via `MetricsConfig` — see
@@ -592,7 +592,7 @@ cover pure logic (config validation, error mapping, argument allowlist
 matching, JWKS algorithm selection, etc.).
 
 **Integration / E2E** tests live in `tests/e2e.rs`. They:
-- Spawn `mcpx::transport::serve(...)` on an **ephemeral port** via
+- Spawn `rmcp_server_kit::transport::serve(...)` on an **ephemeral port** via
   `spawn_server()` (`tests/e2e.rs:46-71`).
 - Use `reqwest` to make real HTTP calls — origin checks, auth, RBAC,
   rate-limiting, readiness, body limits, TLS handshakes.

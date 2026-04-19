@@ -7,21 +7,21 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
-//! End-to-end tests for the mcpx HTTP server stack.
+//! End-to-end tests for the rmcp-server-kit HTTP server stack.
 //!
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal
 //! `ServerHandler` and makes HTTP requests against it.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use mcpx::{
-    auth::{ApiKeyEntry, AuthConfig, RateLimitConfig},
-    rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig},
-    transport::McpServerConfig,
-};
 use rmcp::{
     handler::server::ServerHandler,
     model::{ServerCapabilities, ServerInfo},
+};
+use rmcp_server_kit::{
+    auth::{ApiKeyEntry, AuthConfig, RateLimitConfig},
+    rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig},
+    transport::McpServerConfig,
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -64,7 +64,7 @@ struct ServerHarness {
     shutdown: CancellationToken,
     /// Join handle for the server task. `None` after [`Self::shutdown`]
     /// joins it.
-    join: Option<JoinHandle<mcpx::Result<()>>>,
+    join: Option<JoinHandle<rmcp_server_kit::Result<()>>>,
 }
 
 #[allow(
@@ -105,7 +105,7 @@ impl std::fmt::Display for ServerHarness {
 }
 
 /// Spawn a server on an ephemeral port using
-/// [`mcpx::transport::serve_with_listener`] and return a
+/// [`rmcp_server_kit::transport::serve_with_listener`] and return a
 /// [`ServerHarness`] once the server has signalled readiness.
 ///
 /// Replaces the previous "spawn + poll `/healthz` for 2.5s" pattern
@@ -131,7 +131,7 @@ async fn spawn_server(config: McpServerConfig) -> ServerHarness {
     let shutdown_for_server = shutdown.clone();
 
     let join = tokio::spawn(async move {
-        mcpx::transport::serve_with_listener(
+        rmcp_server_kit::transport::serve_with_listener(
             listener,
             config.validate().expect("test config valid"),
             || TestHandler,
@@ -161,7 +161,7 @@ async fn spawn_server(config: McpServerConfig) -> ServerHarness {
 }
 
 fn config_on_port(port: u16) -> McpServerConfig {
-    McpServerConfig::new(format!("127.0.0.1:{port}"), "test-mcpx", "0.0.1")
+    McpServerConfig::new(format!("127.0.0.1:{port}"), "test-rmcp-server-kit", "0.0.1")
         .with_shutdown_timeout(Duration::from_millis(100))
 }
 
@@ -242,7 +242,7 @@ async fn auth_rejects_unauthenticated_mcp() {
 
 #[tokio::test]
 async fn auth_accepts_valid_bearer() {
-    let (token, hash) = mcpx::auth::generate_api_key().unwrap();
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
     let keys = vec![ApiKeyEntry::new("e2e-key", hash, "ops")];
 
     let port = free_port().await;
@@ -265,7 +265,7 @@ async fn auth_accepts_valid_bearer() {
 
 #[tokio::test]
 async fn auth_rejects_wrong_bearer() {
-    let (_token, hash) = mcpx::auth::generate_api_key().unwrap();
+    let (_token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
     let keys = vec![ApiKeyEntry::new("e2e-key", hash, "ops")];
 
     let port = free_port().await;
@@ -359,7 +359,7 @@ fn tool_call_body(tool: &str, args: &serde_json::Value) -> String {
 
 #[tokio::test]
 async fn rbac_denies_unpermitted_tool() {
-    let (token, hash) = mcpx::auth::generate_api_key().unwrap();
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
     let keys = vec![ApiKeyEntry::new("viewer-key", hash, "viewer")];
 
     let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
@@ -388,7 +388,7 @@ async fn rbac_denies_unpermitted_tool() {
 
 #[tokio::test]
 async fn rbac_allows_permitted_tool() {
-    let (token, hash) = mcpx::auth::generate_api_key().unwrap();
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
     let keys = vec![ApiKeyEntry::new("ops-key", hash, "ops")];
 
     let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
@@ -420,7 +420,7 @@ async fn rbac_allows_permitted_tool() {
 
 #[tokio::test]
 async fn rbac_argument_allowlist_enforced() {
-    let (token, hash) = mcpx::auth::generate_api_key().unwrap();
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
     let keys = vec![ApiKeyEntry::new("exec-key", hash, "restricted")];
 
     let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
@@ -509,7 +509,7 @@ async fn auth_rate_limit_triggers() {
 /// "inner" middleware semantics.
 #[tokio::test]
 async fn c1_origin_rejected_before_auth() {
-    let (_token, hash) = mcpx::auth::generate_api_key().unwrap();
+    let (_token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
     let keys = vec![ApiKeyEntry::new("guard-key", hash, "ops")];
 
     let port = free_port().await;
@@ -541,7 +541,7 @@ async fn c1_origin_rejected_before_auth() {
 /// larger than the configured cap and expect 413 Payload Too Large.
 #[tokio::test]
 async fn c1_body_limit_applies_before_rbac() {
-    let (token, hash) = mcpx::auth::generate_api_key().unwrap();
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
     let keys = vec![ApiKeyEntry::new("ops-key", hash, "ops")];
     let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
         RoleConfig::new("ops", vec!["*".into()], vec!["*".into()]),
@@ -582,13 +582,13 @@ async fn c1_body_limit_applies_before_rbac() {
 // ==========================================================================
 
 #[cfg(feature = "oauth")]
-fn oauth_cfg_with_proxy(expose: bool) -> mcpx::oauth::OAuthConfig {
+fn oauth_cfg_with_proxy(expose: bool) -> rmcp_server_kit::oauth::OAuthConfig {
     // OAuthConfig and OAuthProxyConfig are `#[non_exhaustive]`, so we build
     // them via serde from a TOML-equivalent JSON document. This is the same
     // path real consumers take when loading from a config file.
     let json = serde_json::json!({
         "issuer": "https://upstream.example/",
-        "audience": "mcpx-test",
+        "audience": "rmcp-server-kit-test",
         "jwks_uri": "https://upstream.example/.well-known/jwks.json",
         "jwks_cache_ttl": "10m",
         "proxy": {
@@ -894,7 +894,7 @@ async fn validate_rejects_admin_without_auth() {
     let cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1").enable_admin("admin");
     let err = cfg.validate().expect_err("must reject admin without auth");
     assert!(
-        matches!(err, mcpx::McpxError::Config(ref msg) if msg.contains("admin")),
+        matches!(err, rmcp_server_kit::McpxError::Config(ref msg) if msg.contains("admin")),
         "expected McpxError::Config mentioning admin, got: {err}"
     );
 }
@@ -912,14 +912,16 @@ async fn validate_rejects_partial_tls_pair() {
     let err = cfg
         .validate()
         .expect_err("cert without key must be rejected");
-    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("tls_key_path")));
+    assert!(matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("tls_key_path")));
 
     let mut cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1");
     cfg.tls_key_path = Some(std::path::PathBuf::from("/tmp/key.pem"));
     let err = cfg
         .validate()
         .expect_err("key without cert must be rejected");
-    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("tls_cert_path")));
+    assert!(
+        matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("tls_cert_path"))
+    );
 
     // Both set together: only the *file existence* matters at startup,
     // not validate() -- so this should pass validation.
@@ -935,7 +937,7 @@ async fn validate_rejects_other_misconfig() {
     // Unparseable bind_addr
     let cfg = McpServerConfig::new("not-a-socket-addr", "t", "0");
     let err = cfg.validate().expect_err("must reject bad bind_addr");
-    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("bind_addr")));
+    assert!(matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("bind_addr")));
 
     // public_url without scheme
     let cfg =
@@ -943,17 +945,21 @@ async fn validate_rejects_other_misconfig() {
     let err = cfg
         .validate()
         .expect_err("must reject schemeless public_url");
-    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("public_url")));
+    assert!(matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("public_url")));
 
     // origin without scheme
     let cfg = McpServerConfig::new("127.0.0.1:0", "t", "0").with_allowed_origins(["localhost"]);
     let err = cfg.validate().expect_err("must reject schemeless origin");
-    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("allowed_origins")));
+    assert!(
+        matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("allowed_origins"))
+    );
 
     // zero body cap
     let cfg = McpServerConfig::new("127.0.0.1:0", "t", "0").with_max_request_body(0);
     let err = cfg.validate().expect_err("must reject zero body cap");
-    assert!(matches!(err, mcpx::McpxError::Config(ref m) if m.contains("max_request_body")));
+    assert!(
+        matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("max_request_body"))
+    );
 }
 
 // ==========================================================================
@@ -961,14 +967,14 @@ async fn validate_rejects_other_misconfig() {
 // ==========================================================================
 
 /// Spin up a server whose factory wraps `TestHandler` in a
-/// [`mcpx::tool_hooks::HookedHandler`].  This proves the new async hook
+/// [`rmcp_server_kit::tool_hooks::HookedHandler`].  This proves the new async hook
 /// types satisfy `serve_with_listener`'s `ServerHandler` bound and that
 /// hook plumbing does not break the basic transport path.
 #[tokio::test]
 async fn hooked_handler_serves_healthz() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use mcpx::tool_hooks::{AfterHook, BeforeHook, HookOutcome, ToolHooks, with_hooks};
+    use rmcp_server_kit::tool_hooks::{AfterHook, BeforeHook, HookOutcome, ToolHooks, with_hooks};
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -1017,7 +1023,7 @@ async fn hooked_handler_serves_healthz() {
     let hooks_for_factory = Arc::clone(&hooks);
 
     let join = tokio::spawn(async move {
-        mcpx::transport::serve_with_listener(
+        rmcp_server_kit::transport::serve_with_listener(
             listener,
             cfg.validate().expect("test config valid"),
             move || with_hooks(TestHandler, Arc::clone(&hooks_for_factory)),
@@ -1046,17 +1052,17 @@ async fn hooked_handler_serves_healthz() {
     let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
 }
 
-/// Constructing all three [`mcpx::tool_hooks::HookOutcome`] variants
+/// Constructing all three [`rmcp_server_kit::tool_hooks::HookOutcome`] variants
 /// must compile and round-trip through the public API.  This guards
 /// against accidental visibility regressions on the new enum during
 /// future refactors.
 #[test]
 fn hook_outcome_variants_are_constructible() {
-    use mcpx::tool_hooks::HookOutcome;
     use rmcp::{
         ErrorData,
         model::{CallToolResult, Content},
     };
+    use rmcp_server_kit::tool_hooks::HookOutcome;
 
     let _ = HookOutcome::Continue;
     let _ = HookOutcome::Deny(ErrorData::invalid_request("denied", None));

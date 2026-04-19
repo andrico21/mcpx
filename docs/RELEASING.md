@@ -1,13 +1,18 @@
-# Releasing `mcpx`
+# Releasing `rmcp-server-kit`
 
 ## Cadence
 
-- **Patch** (`0.9.x`): bug fixes, docs, non-breaking dep updates. Ship
-  whenever backlog justifies it.
-- **Minor** (`0.x.0`): new features; pre-1.0 may include breaking changes
-  (documented in CHANGELOG).
-- **Major** (`x.0.0`): reserved for 1.0 and later; strict semver from 1.0
-  onward.
+`rmcp-server-kit` follows strict [SemVer 2.0.0](https://semver.org/) from `1.0.0`
+onward.
+
+- **Patch** (`1.x.y`): bug fixes, docs, non-breaking dependency updates.
+  Ship whenever backlog justifies it.
+- **Minor** (`1.x.0`): backward-compatible new features and additive
+  public API. New methods on `#[non_exhaustive]` types and new variants
+  on `#[non_exhaustive]` enums are minor-bumped, not major.
+- **Major** (`x.0.0`): reserved for breaking changes. Avoid until
+  unavoidable; bundle related breaks together and provide a migration
+  guide in [`docs/MIGRATION.md`](MIGRATION.md).
 
 ## Pre-flight checklist
 
@@ -23,7 +28,7 @@
 
 ```bash
 # 1. Pick the version
-export NEW_VERSION=0.9.31
+export NEW_VERSION=1.0.1
 
 # 2. Update CHANGELOG.md
 #    - Move "Unreleased" items under "## [$NEW_VERSION] - YYYY-MM-DD"
@@ -38,7 +43,7 @@ git commit -m "chore: release $NEW_VERSION"
 git push origin main
 
 # 5. Tag
-git tag -a "$NEW_VERSION" -m "mcpx $NEW_VERSION"
+git tag -a "$NEW_VERSION" -m "rmcp-server-kit $NEW_VERSION"
 git push origin "$NEW_VERSION"
 ```
 
@@ -54,7 +59,7 @@ The `release.yml` workflow then:
 If a release needs to be withdrawn:
 
 ```bash
-cargo yank --version $VERSION mcpx
+cargo yank --version $VERSION rmcp-server-kit
 ```
 
 Then cut a follow-up patch release that fixes the issue and document both
@@ -66,6 +71,6 @@ When publishing a release that affects downstream crates (e.g.
 `atlassian-mcp`):
 
 1. Update the downstream `Cargo.toml` to the new version.
-2. Run the downstream test suite against the new `mcpx`.
-3. Open a PR on the downstream repo; link back to the `mcpx` release
+2. Run the downstream test suite against the new `rmcp-server-kit`.
+3. Open a PR on the downstream repo; link back to the `rmcp-server-kit` release
    notes.

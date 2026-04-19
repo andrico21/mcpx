@@ -1,4 +1,4 @@
-# GitLab CI template for mcpx.
+# GitLab CI template for rmcp-server-kit.
 # Host-neutral alternative to .github/workflows/ — use whichever matches
 # your repository host.
 
@@ -79,7 +79,7 @@ publish:
     - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+$/
   script:
     - TAG="${CI_COMMIT_TAG}"
-    - CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mcpx") | .version')
+    - CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rmcp-server-kit") | .version')
     - test "$TAG" = "$CRATE_VERSION"
     - cargo publish --dry-run --all-features
     - cargo publish --all-features --token "$CARGO_REGISTRY_TOKEN"

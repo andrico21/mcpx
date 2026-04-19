@@ -1,4 +1,4 @@
-//! Memory-bound regression test for [`mcpx::bounded_limiter::BoundedKeyedLimiter`].
+//! Memory-bound regression test for [`rmcp_server_kit::bounded_limiter::BoundedKeyedLimiter`].
 //!
 //! This test pushes one million distinct source IPs through a 10 000-key
 //! bounded limiter and asserts that the resident set does not grow by more
@@ -15,7 +15,7 @@
 
 use std::{net::IpAddr, time::Duration};
 
-use mcpx::bounded_limiter::BoundedKeyedLimiter;
+use rmcp_server_kit::bounded_limiter::BoundedKeyedLimiter;
 
 /// Maximum permissible RSS growth (in MiB) over the test body.
 ///

@@ -1,5 +1,5 @@
 # Clippy threshold configuration.
-# Applied locally within the mcpx crate.
+# Applied locally within the rmcp-server-kit crate.
 
 cognitive-complexity-threshold = 25
 too-many-lines-threshold = 100

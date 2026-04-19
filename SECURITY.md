@@ -8,7 +8,7 @@
 | 0.10.x   | ✅        |
 | < 0.10   | ❌        |
 
-Once `mcpx` reaches 1.0, we will support the latest minor release and the
+Once `rmcp-server-kit` reaches 1.0, we will support the latest minor release and the
 previous one for security fixes.
 
 ## Reporting a vulnerability
@@ -49,7 +49,7 @@ within **30 days** for confirmed high-severity issues.
 
 ## Certificate revocation
 
-> ⚠️ **mcpx does NOT validate CRL or OCSP for client certificates.**
+> ⚠️ **rmcp-server-kit does NOT validate CRL or OCSP for client certificates.**
 > mTLS authentication is verified **point-in-time at the TLS handshake**
 > against the configured trust roots. There is **no online revocation
 > check**, no CRL fetcher, and no OCSP stapling validator.
@@ -73,14 +73,14 @@ band** using one of the following workflows.
    - Issue with [Smallstep `step-ca`](https://smallstep.com/docs/step-ca/)
      and the autorenewal daemon.
 2. **CA rotation on compromise** — for longer-lived certs, you MUST
-   rotate the issuing CA and reload mcpx (use the `ReloadHandle` from
+   rotate the issuing CA and reload rmcp-server-kit (use the `ReloadHandle` from
    `transport::serve()` to swap trust roots without restart).
 3. **Network-layer revocation** — block compromised peers at your
    service mesh / load balancer / firewall.
 
 ### What "point-in-time mTLS" means
 
-When a client presents a certificate, mcpx (via `rustls`) verifies:
+When a client presents a certificate, rmcp-server-kit (via `rustls`) verifies:
 
 - The chain validates against the configured CA roots.
 - The leaf certificate's `notBefore` / `notAfter` window covers
@@ -98,7 +98,7 @@ until the connection is closed by either side.**
   associated certificate. ≤24h cert lifetimes bound this exposure.
 - An evicted operator's certificate remains valid until expiry. Use
   short-lived certs and/or rotate the issuing CA.
-- mcpx does **not** participate in any revocation protocol. Adding CRL
+- rmcp-server-kit does **not** participate in any revocation protocol. Adding CRL
   or OCSP validation is **deferred** and tracked as a future
   enhancement (no committed timeline).
 

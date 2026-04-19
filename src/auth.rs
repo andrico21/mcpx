@@ -261,7 +261,7 @@ fn default_mtls_role() -> String {
 
 /// Rate limiting configuration for authentication attempts.
 ///
-/// mcpx uses two independent per-IP token-bucket limiters for auth:
+/// rmcp-server-kit uses two independent per-IP token-bucket limiters for auth:
 ///
 /// 1. **Pre-auth abuse gate** ([`Self::pre_auth_max_per_minute`]): consulted
 ///    *before* any password-hash work. Throttles unauthenticated traffic from

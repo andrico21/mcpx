@@ -1,4 +1,4 @@
-# Contributing to mcpx
+# Contributing to rmcp-server-kit
 
 Thanks for your interest in contributing!
 

@@ -98,7 +98,7 @@ impl Default for ServerConfig {
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
 pub struct ObservabilityConfig {
-    /// `tracing` log level / env filter string (e.g. `info,mcpx=debug`).
+    /// `tracing` log level / env filter string (e.g. `info,rmcp_server_kit=debug`).
     #[serde(default = "default_log_level")]
     pub log_level: String,
     /// Log output format: `json` or `text`.

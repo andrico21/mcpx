@@ -44,10 +44,10 @@
 use std::{hint::black_box, sync::Arc};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use mcpx::tool_hooks::{
+use rmcp::model::{CallToolResult, Content};
+use rmcp_server_kit::tool_hooks::{
     AfterHook, BeforeHook, HookDisposition, HookOutcome, ToolCallContext, ToolHooks,
 };
-use rmcp::model::{CallToolResult, Content};
 use tokio::runtime::Builder;
 
 fn make_ctx() -> ToolCallContext {

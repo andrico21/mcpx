@@ -1,4 +1,4 @@
-# mcpx -- MCP Server Framework for Rust
+# rmcp-server-kit -- MCP Server Framework for Rust
 
 A production-grade, reusable framework for building
 [Model Context Protocol](https://modelcontextprotocol.io/) servers in Rust.
@@ -7,7 +7,7 @@ authentication (Bearer / mTLS / OAuth 2.1 JWT), role-based access control
 (RBAC), per-IP rate limiting, and Prometheus metrics -- all wired up and
 ready to go.
 
-You supply a `ServerHandler` implementation; mcpx handles everything else.
+You supply a `ServerHandler` implementation; rmcp-server-kit handles everything else.
 
 ---
 
@@ -28,6 +28,7 @@ You supply a `ServerHandler` implementation; mcpx handles everything else.
 - [Additional Built-in Endpoints and Features](#additional-built-in-endpoints-and-features)
 - [Full Example: Building a Custom MCP Server](#full-example-building-a-custom-mcp-server)
 - [Client Usage Guide](#client-usage-guide)
+- [Recipes](#recipes)
 - [Configuration via TOML](#configuration-via-toml)
 - [Testing Your Server](#testing-your-server)
 
@@ -35,11 +36,11 @@ You supply a `ServerHandler` implementation; mcpx handles everything else.
 
 ## Quick Start
 
-Add mcpx to your `Cargo.toml`:
+Add rmcp-server-kit to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mcpx = { version = "0.12", features = ["oauth"] }
+rmcp-server-kit = { version = "1", features = ["oauth"] }
 rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```
@@ -47,7 +48,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 Implement `ServerHandler` and call `serve()`:
 
 ```rust
-use mcpx::transport::{McpServerConfig, serve};
+use rmcp_server_kit::transport::{McpServerConfig, serve};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 
@@ -61,8 +62,8 @@ impl ServerHandler for MyHandler {
 }
 
 #[tokio::main]
-async fn main() -> mcpx::Result<()> {
-    let _ = mcpx::observability::init_tracing("info,my_server=debug");
+async fn main() -> rmcp_server_kit::Result<()> {
+    let _ = rmcp_server_kit::observability::init_tracing("info,my_server=debug");
 
     let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
         .with_request_timeout(std::time::Duration::from_secs(30))
@@ -85,7 +86,7 @@ This gives you `/healthz`, `/readyz`, and `/mcp` endpoints out of the box.
 Enable in `Cargo.toml`:
 
 ```toml
-mcpx = { version = "0.12", features = ["oauth", "metrics"] }
+rmcp-server-kit = { version = "1", features = ["oauth", "metrics"] }
 ```
 
 ---
@@ -102,7 +103,7 @@ mcpx = { version = "0.12", features = ["oauth", "metrics"] }
                           | depends on
                           v
                     +-----------+
-                    |   mcpx    |   (lib crate)
+                    | rmcp-server-kit |   (lib crate)
                     |           |
                     | transport |   Streamable HTTP + TLS/mTLS
                     | auth      |   Bearer, mTLS, OAuth JWT
@@ -124,9 +125,9 @@ mcpx = { version = "0.12", features = ["oauth", "metrics"] }
                     +-----------+
 ```
 
-**Key design rule:** mcpx is generic. It has zero knowledge of your domain
+**Key design rule:** rmcp-server-kit is generic. It has zero knowledge of your domain
 (Podman, Docker, databases, etc.). Your crate supplies the `ServerHandler`;
-mcpx supplies the server infrastructure.
+rmcp-server-kit supplies the server infrastructure.
 
 ---
 
@@ -142,7 +143,7 @@ Server configuration. All fields have safe defaults except `bind_addr`,
 `name`, and `version`.
 
 ```rust
-use mcpx::transport::McpServerConfig;
+use rmcp_server_kit::transport::McpServerConfig;
 use std::time::Duration;
 
 // Builder style (recommended): chain `with_*` / `enable_*` methods.
@@ -194,7 +195,7 @@ config.validate().expect("config valid");
 #### `serve()`
 
 ```rust
-pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> mcpx::Result<()>
+pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> rmcp_server_kit::Result<()>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
@@ -216,7 +217,7 @@ fresh handler for each MCP session. The server:
 Custom readiness probe for `/readyz`:
 
 ```rust
-use mcpx::transport::ReadinessCheck;
+use rmcp_server_kit::transport::ReadinessCheck;
 use std::sync::Arc;
 
 let check: ReadinessCheck = Arc::new(|| {
@@ -256,7 +257,7 @@ Authentication middleware supporting three methods (tried in priority order):
 #### `AuthConfig`
 
 ```rust
-use mcpx::auth::{AuthConfig, ApiKeyEntry, RateLimitConfig};
+use rmcp_server_kit::auth::{AuthConfig, ApiKeyEntry, RateLimitConfig};
 
 // Simple: just API keys
 let auth = AuthConfig::with_keys(vec![
@@ -294,10 +295,10 @@ let auth = AuthConfig::with_keys(vec![
 Represents a single API key. The `hash` field stores an Argon2id PHC string.
 
 ```rust
-use mcpx::auth::{generate_api_key, ApiKeyEntry};
+use rmcp_server_kit::auth::{generate_api_key, ApiKeyEntry};
 
-// Generate a new key pair
-let (plaintext_token, argon2id_hash) = generate_api_key();
+// Generate a new key pair (returns Result<_, McpxError>)
+let (plaintext_token, argon2id_hash) = generate_api_key()?;
 // plaintext_token: 43-char base64url string (give to client)
 // argon2id_hash:   PHC format string (store in config)
 
@@ -310,7 +311,7 @@ let key = ApiKeyEntry::new("temp-key", hash, "viewer")
 
 #### `RateLimitConfig`
 
-Per-source-IP rate limiting for authentication. mcpx uses two independent
+Per-source-IP rate limiting for authentication. rmcp-server-kit uses two independent
 token-bucket limiters keyed by source IP:
 
 1. **Pre-auth abuse gate** (`pre_auth_max_per_minute`, optional): consulted
@@ -327,7 +328,7 @@ token-bucket limiters keyed by source IP:
    backpressure on bad credentials.
 
 ```rust
-use mcpx::auth::RateLimitConfig;
+use rmcp_server_kit::auth::RateLimitConfig;
 
 // Default: 30 failed attempts/min and ~300 unauthenticated requests/min
 // (10x default) per source IP.
@@ -342,12 +343,13 @@ When exceeded, the middleware returns HTTP 429 Too Many Requests.
 #### `generate_api_key()`
 
 ```rust
-pub fn generate_api_key() -> (String, String)
+pub fn generate_api_key() -> Result<(String, String), McpxError>
 ```
 
-Returns `(plaintext_token, argon2id_hash)`. The token is 256-bit random,
+Returns `Ok((plaintext_token, argon2id_hash))`. The token is 256-bit random,
 base64url-encoded (43 characters). Store the hash in your config file; give
-the plaintext token to the client.
+the plaintext token to the client. The `Result` accommodates the rare case
+where the OS RNG fails.
 
 #### `AuthIdentity`
 
@@ -402,8 +404,8 @@ DNS SAN as the identity name. Used internally by the TLS acceptor.
 
 #### Certificate lifecycle and revocation (operator runbook)
 
-> **mcpx does NOT validate CRL or OCSP for client certificates.** mTLS
-> trust in mcpx is *point-in-time*: a cert is accepted whenever it
+> **rmcp-server-kit does NOT validate CRL or OCSP for client certificates.** mTLS
+> trust in rmcp-server-kit is *point-in-time*: a cert is accepted whenever it
 > chains to a configured CA and is within its `notBefore`/`notAfter`
 > window. Revocation must be enforced *out of band*. See
 > [SECURITY.md](../SECURITY.md#certificate-revocation) for the full
@@ -428,7 +430,7 @@ the following revocation strategies:
      `step ca renew --daemon` for hands-off rotation.
 
 2. **CA rotation on compromise.** If a long-lived cert leaks, rotate
-   the issuing CA and update `mtls.ca_cert_path` in your mcpx config.
+   the issuing CA and update `mtls.ca_cert_path` in your rmcp-server-kit config.
    Use `ReloadHandle::reload_*` (see `transport::ReloadHandle`) for a
    zero-downtime swap.
 
@@ -460,7 +462,7 @@ argument allowlists, and host-scoped visibility.
 #### `RbacConfig`
 
 ```rust
-use mcpx::rbac::{RbacConfig, RoleConfig, ArgumentAllowlist};
+use rmcp_server_kit::rbac::{RbacConfig, RoleConfig, ArgumentAllowlist};
 
 let config = RbacConfig::with_roles(vec![
     // Admin: full access
@@ -553,7 +555,7 @@ is rejected with 403.
 Compiled policy for fast lookups. Built from `RbacConfig` at startup.
 
 ```rust
-use mcpx::rbac::{RbacPolicy, RbacConfig, RbacDecision};
+use rmcp_server_kit::rbac::{RbacPolicy, RbacConfig, RbacDecision};
 use std::sync::Arc;
 
 let config = RbacConfig::with_roles(vec![/* ... */]);
@@ -602,7 +604,7 @@ assert!(!policy.host_visible("viewer", "dev-west"));
 Inside your tool handlers, retrieve the current caller's identity:
 
 ```rust
-use mcpx::rbac::{current_role, current_identity};
+use rmcp_server_kit::rbac::{current_role, current_identity};
 
 fn handle_tool_call() {
     if let Some(role) = current_role() {
@@ -688,7 +690,7 @@ metrics_bind = "127.0.0.1:9090"
 #### Validation
 
 ```rust
-use mcpx::config::{
+use rmcp_server_kit::config::{
     ServerConfig, ObservabilityConfig,
     validate_server_config, validate_observability_config,
 };
@@ -743,7 +745,7 @@ is safe to call from tests or embedders that may have already installed
 a global subscriber:
 
 ```rust
-mcpx::observability::init_tracing("info,my_crate=debug")?;
+rmcp_server_kit::observability::init_tracing("info,my_crate=debug")?;
 ```
 
 Respects `RUST_LOG` environment variable (takes precedence over the default).
@@ -757,10 +759,10 @@ Full initialization from `ObservabilityConfig`. Same `Result` semantics
 as [`init_tracing`]:
 
 ```rust
-use mcpx::config::ObservabilityConfig;
+use rmcp_server_kit::config::ObservabilityConfig;
 
 let obs: ObservabilityConfig = toml::from_str(&config_toml)?;
-mcpx::observability::init_tracing_from_config(&obs)?;
+rmcp_server_kit::observability::init_tracing_from_config(&obs)?;
 ```
 
 Features:
@@ -822,7 +824,7 @@ validation vs. API key verification.
 pub fn protected_resource_metadata(resource_url: &str, config: &OAuthConfig) -> serde_json::Value
 ```
 
-Generates RFC 9728 Protected Resource Metadata JSON. mcpx automatically
+Generates RFC 9728 Protected Resource Metadata JSON. rmcp-server-kit automatically
 serves this at `/.well-known/oauth-protected-resource` when OAuth is
 configured.
 
@@ -837,7 +839,7 @@ Prometheus metrics collection and exposition.
 #### `McpMetrics`
 
 ```rust
-use mcpx::metrics::McpMetrics;
+use rmcp_server_kit::metrics::McpMetrics;
 
 let metrics = McpMetrics::new()?;
 
@@ -853,11 +855,11 @@ Tracks:
 #### `serve_metrics()`
 
 ```rust
-pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> mcpx::Result<()>
+pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> rmcp_server_kit::Result<()>
 ```
 
 Spawns a dedicated HTTP listener serving `/metrics` in Prometheus text format.
-You don't call this directly -- mcpx spawns it automatically when
+You don't call this directly -- rmcp-server-kit spawns it automatically when
 `metrics_enabled = true` on `McpServerConfig`.
 
 ---
@@ -876,7 +878,7 @@ describing the running binary:
   "build_sha": "abcdef0",
   "build_time": "2025-01-15T12:00:00Z",
   "rust_version": "rustc 1.95.0",
-  "mcpx_version": "0.9.30"
+  "mcpx_version": "1.0.0"
 }
 ```
 
@@ -900,7 +902,7 @@ rather than queued.
 ### `/admin/*` diagnostic endpoints (opt-in)
 
 When `admin_enabled = true` and an authenticated role equal to
-`admin_role` (default `"admin"`) is configured, mcpx exposes:
+`admin_role` (default `"admin"`) is configured, rmcp-server-kit exposes:
 
 - `GET /admin/status` -- server name, version, uptime.
 - `GET /admin/auth/keys` -- names, roles, and expiry of configured API
@@ -917,7 +919,7 @@ startup with a configuration error.
 
 ### `Secret<T>` re-exports
 
-`mcpx::secret` re-exports `ExposeSecret`, `SecretBox`, and `SecretString`
+`rmcp_server_kit::secret` re-exports `ExposeSecret`, `SecretBox`, and `SecretString`
 from [`secrecy`]. Prefer these wrappers for any secret-bearing fields
 added to application config structs so that `Debug` and serialization
 never leak plaintext.
@@ -925,7 +927,7 @@ never leak plaintext.
 ### OAuth 2.1 introspection (RFC 7662) and revocation (RFC 7009)
 
 Set `OAuthProxyConfig::introspection_url` and/or
-`OAuthProxyConfig::revocation_url` to upstream endpoint URLs and mcpx
+`OAuthProxyConfig::revocation_url` to upstream endpoint URLs and rmcp-server-kit
 will expose matching local proxies:
 
 - `POST /introspect` -- forwards the form body to the upstream
@@ -940,7 +942,7 @@ corresponding URLs are configured.
 
 ### Tool hooks and result-size cap
 
-`mcpx::tool_hooks::HookedHandler` is an opt-in wrapper around any
+`rmcp_server_kit::tool_hooks::HookedHandler` is an opt-in wrapper around any
 `ServerHandler` that adds:
 
 - An async `before` hook that returns `HookOutcome::Continue` (proceed),
@@ -966,7 +968,7 @@ so direct struct-literal construction is no longer supported):
 
 ```rust
 use std::sync::Arc;
-use mcpx::tool_hooks::{HookOutcome, ToolHooks, with_hooks};
+use rmcp_server_kit::tool_hooks::{HookOutcome, ToolHooks, with_hooks};
 
 let hooks = Arc::new(
     ToolHooks::new()
@@ -1001,7 +1003,7 @@ let handler = with_hooks(MyHandler::new(), hooks);
 // ...pass `handler` to `serve()`...
 ```
 
-`mcpx::serve()` itself never wraps handlers automatically.
+`rmcp_server_kit::serve()` itself never wraps handlers automatically.
 
 ---
 
@@ -1012,9 +1014,9 @@ A complete server with auth, RBAC, custom tools, and readiness probe:
 ```rust
 use std::sync::Arc;
 
-use mcpx::auth::{AuthConfig, ApiKeyEntry, RateLimitConfig, generate_api_key};
-use mcpx::rbac::{RbacConfig, RbacPolicy, RoleConfig, current_role};
-use mcpx::transport::{McpServerConfig, serve};
+use rmcp_server_kit::auth::{AuthConfig, ApiKeyEntry, RateLimitConfig, generate_api_key};
+use rmcp_server_kit::rbac::{RbacConfig, RbacPolicy, RoleConfig, current_role};
+use rmcp_server_kit::transport::{McpServerConfig, serve};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, Error as McpError};
@@ -1046,12 +1048,12 @@ impl ServerHandler for MyHandler {
 }
 
 #[tokio::main]
-async fn main() -> mcpx::Result<()> {
-    let _ = mcpx::observability::init_tracing("info");
+async fn main() -> rmcp_server_kit::Result<()> {
+    let _ = rmcp_server_kit::observability::init_tracing("info");
 
     // Generate API keys (in production, store hashes in a config file)
-    let (admin_token, admin_hash) = generate_api_key();
-    let (viewer_token, viewer_hash) = generate_api_key();
+    let (admin_token, admin_hash) = generate_api_key()?;
+    let (viewer_token, viewer_hash) = generate_api_key()?;
     tracing::info!(token = %admin_token, "admin token (rotate before production)");
     tracing::info!(token = %viewer_token, "viewer token (rotate before production)");
 
@@ -1167,7 +1169,7 @@ curl -X POST http://127.0.0.1:8443/mcp \
 
 ### Using with MCP Clients
 
-mcpx implements the standard MCP Streamable HTTP transport, so any compliant
+rmcp-server-kit implements the standard MCP Streamable HTTP transport, so any compliant
 MCP client works:
 
 ```json
@@ -1185,9 +1187,214 @@ MCP client works:
 
 ---
 
-## Configuration via TOML
+## Recipes
 
-mcpx config structs derive `Deserialize`, so you can load them directly from
+Short, copy-pasteable snippets for the most common production setups. Each
+recipe shows only the wiring relevant to that feature; assemble them inside
+the `Quick Start` `main()` skeleton.
+
+Two of these recipes are also available as runnable examples in the
+repository:
+
+```bash
+cargo run --example api_key_rbac
+cargo run --example oauth_server --features oauth
+```
+
+### Recipe 1: OAuth 2.1 resource server (JWT validation)
+
+Validate `Authorization: Bearer <jwt>` against a remote JWKS and map scopes
+onto RBAC roles. Requires the `oauth` feature.
+
+```rust,ignore
+use std::sync::Arc;
+use rmcp_server_kit::auth::AuthConfig;
+use rmcp_server_kit::oauth::OAuthConfig;
+use rmcp_server_kit::rbac::{RbacConfig, RbacPolicy, RoleConfig};
+use rmcp_server_kit::transport::McpServerConfig;
+
+let oauth = OAuthConfig::builder(
+    "https://auth.example.com/",
+    "my-mcp-server",
+    "https://auth.example.com/.well-known/jwks.json",
+)
+.scope("mcp:admin", "admin")
+.scope("mcp:read", "viewer")
+.build();
+
+let mut auth = AuthConfig::with_keys(vec![]);
+auth.oauth = Some(oauth);
+
+let rbac = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+    RoleConfig::new("admin", vec!["*".into()], vec!["*".into()]),
+    RoleConfig::new("viewer", vec!["resource_list".into()], vec!["*".into()]),
+])));
+
+let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+    .with_auth(auth)
+    .with_rbac(rbac)
+    .with_public_url("http://127.0.0.1:8080");
+```
+
+### Recipe 2: OAuth proxy + token exchange + introspection
+
+Expose `/oauth/authorize`, `/oauth/token`, `/oauth/introspect`, and
+`/oauth/revoke` endpoints that proxy to your IdP, optionally exchanging
+the client's token for a downstream service token (RFC 8693). Requires
+`oauth`.
+
+```rust,ignore
+use rmcp_server_kit::oauth::{OAuthConfig, OAuthProxyConfig, TokenExchangeConfig};
+use secrecy::SecretString;
+
+let proxy = OAuthProxyConfig::builder(
+    "https://auth.example.com/oauth/authorize",
+    "https://auth.example.com/oauth/token",
+    "my-client-id",
+)
+.client_secret(SecretString::new("my-client-secret".into()))
+.introspection_url("https://auth.example.com/oauth/introspect")
+.revocation_url("https://auth.example.com/oauth/revoke")
+.expose_admin_endpoints(true)
+.build();
+
+let token_exchange = TokenExchangeConfig::new(
+    "https://downstream.example.com/oauth/token",
+    "downstream-client-id",
+    SecretString::new("downstream-secret".into()),
+    None,                                     // optional client cert (mTLS)
+    "downstream-audience",
+);
+
+let oauth = OAuthConfig::builder(
+    "https://auth.example.com/",
+    "my-mcp-server",
+    "https://auth.example.com/.well-known/jwks.json",
+)
+.proxy(proxy)
+.token_exchange(token_exchange)
+.build();
+```
+
+Inside a tool handler, retrieve the (already-exchanged) downstream token via:
+
+```rust,ignore
+if let Some(token) = rmcp_server_kit::rbac::current_token() {
+    // use token.expose_secret() as Authorization header
+}
+```
+
+### Recipe 3: API key + RBAC + per-tool argument allowlist
+
+Argon2-hashed API keys with role-based tool allowlists and per-argument
+constraints.
+
+```rust,ignore
+use std::sync::Arc;
+use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, generate_api_key};
+use rmcp_server_kit::rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig};
+
+// In production, load pre-generated PHC hashes from config instead.
+let (admin_token, admin_hash) = generate_api_key()?;
+let (viewer_token, viewer_hash) = generate_api_key()?;
+
+let auth = AuthConfig::with_keys(vec![
+    ApiKeyEntry::new("admin-key", admin_hash, "admin"),
+    ApiKeyEntry::new("viewer-key", viewer_hash, "viewer"),
+]);
+
+let viewer = RoleConfig::new(
+    "viewer",
+    vec!["echo".into(), "resource_list".into()],
+    vec!["*".into()],
+)
+.with_argument_allowlists(vec![ArgumentAllowlist::new(
+    "echo", "message", vec!["hello".into(), "ping".into()],
+)]);
+
+let rbac = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+    RoleConfig::new("admin", vec!["*".into()], vec!["*".into()]),
+    viewer,
+])));
+```
+
+### Recipe 4: mTLS server (client certificate authentication)
+
+Require client certificates signed by a known CA. Identity (CN) and role
+are extracted from the cert. Combine with API keys / OAuth for hybrid auth,
+or use mTLS-only by leaving `api_keys` empty.
+
+```rust,ignore
+use std::path::PathBuf;
+use rmcp_server_kit::auth::{AuthConfig, MtlsConfig};
+
+let mut auth = AuthConfig::with_keys(vec![]);
+auth.mtls = Some(MtlsConfig {
+    ca_cert_path: PathBuf::from("/etc/certs/client-ca.pem"),
+    required: true,                  // reject connections without a client cert
+    default_role: "operator".into(), // role used when cert CN has no explicit mapping
+});
+
+let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
+    .with_auth(auth)
+    .with_tls("/etc/certs/server.crt", "/etc/certs/server.key");
+```
+
+### Recipe 5: Prometheus metrics
+
+Expose a `/metrics` endpoint on a separate listener (so it can bind to a
+private interface or different port). Requires the `metrics` feature.
+
+```rust,ignore
+let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+    .with_metrics("127.0.0.1:9090".parse().unwrap());
+```
+
+The registry exposes request counters, latency histograms, auth/RBAC
+outcomes, and tool-call metrics out of the box. Add your own metrics by
+registering them against `rmcp_server_kit::metrics::registry()`.
+
+### Recipe 6: Tool hooks (audit + deny + result-size cap)
+
+Wrap a `ServerHandler` with async `before` / `after` hooks to audit every
+tool invocation, deny calls based on runtime state, and cap result sizes.
+
+```rust,ignore
+use std::sync::Arc;
+use rmcp_server_kit::tool_hooks::{HookOutcome, ToolHooks, with_hooks};
+
+let hooks = Arc::new(
+    ToolHooks::new()
+        .with_max_result_bytes(1_048_576) // 1 MiB cap on tool results
+        .with_before(Arc::new(|ctx| {
+            Box::pin(async move {
+                tracing::info!(tool = %ctx.tool_name, role = ?ctx.role, "tool call");
+                // Return HookOutcome::Deny(...) to reject, or
+                // HookOutcome::Replace(Box::new(result)) to short-circuit.
+                HookOutcome::Continue
+            })
+        }))
+        .with_after(Arc::new(|ctx, disposition, bytes| {
+            Box::pin(async move {
+                tracing::info!(
+                    tool = %ctx.tool_name,
+                    ?disposition,
+                    bytes,
+                    "tool call finished"
+                );
+            })
+        })),
+);
+
+let handler_factory = move || with_hooks(MyHandler, Arc::clone(&hooks));
+serve(config.validate()?, handler_factory).await
+```
+
+---
+
+
+
+rmcp-server-kit config structs derive `Deserialize`, so you can load them directly from
 TOML. A complete example:
 
 ```toml
@@ -1292,12 +1499,12 @@ metrics_bind = "127.0.0.1:9090"
 
 ## Testing Your Server
 
-mcpx includes 114 tests (unit, integration, and end-to-end). For your own
+rmcp-server-kit includes 114 tests (unit, integration, and end-to-end). For your own
 server, you can write similar e2e tests using `reqwest`:
 
 ```rust
-use mcpx::auth::{AuthConfig, ApiKeyEntry, generate_api_key};
-use mcpx::transport::{McpServerConfig, serve};
+use rmcp_server_kit::auth::{AuthConfig, ApiKeyEntry, generate_api_key};
+use rmcp_server_kit::transport::{McpServerConfig, serve};
 use std::time::Duration;
 
 async fn free_port() -> u16 {
@@ -1351,15 +1558,15 @@ async fn test_auth_rejects_unauthenticated() {
 }
 ```
 
-Run the mcpx test suite:
+Run the rmcp-server-kit test suite:
 
 ```bash
 # All tests (requires all features)
-cargo test -p mcpx --all-features
+cargo test -p rmcp-server-kit --all-features
 
 # Just e2e tests
-cargo test -p mcpx --all-features --test e2e
+cargo test -p rmcp-server-kit --all-features --test e2e
 
 # Just unit tests
-cargo test -p mcpx --all-features --lib
+cargo test -p rmcp-server-kit --all-features --lib
 ```

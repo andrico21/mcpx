@@ -1,17 +1,17 @@
 [package]
-name = "mcpx"
-version = "1.0.0-rc1"
+name = "rmcp-server-kit"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
-description = "Reusable MCP server framework with auth, RBAC, and Streamable HTTP transport"
+description = "Reusable MCP server framework with auth, RBAC, and Streamable HTTP transport (built on the rmcp SDK)"
 readme = "README.md"
 repository = "https://github.com/andrico21/mcpx"
 homepage = "https://github.com/andrico21/mcpx"
-documentation = "https://docs.rs/mcpx"
-keywords = ["mcp", "model-context-protocol", "server", "oauth", "rbac"]
+documentation = "https://docs.rs/rmcp-server-kit"
+keywords = ["mcp", "rmcp", "server", "oauth", "rbac"]
 categories = ["network-programming", "web-programming::http-server", "authentication"]
-authors = ["mcpx contributors"]
+authors = ["rmcp-server-kit contributors"]
 exclude = [
     "target/",
     "flycheck0/",
@@ -20,6 +20,10 @@ exclude = [
     ".github/",
     ".gitlab-ci.yml",
 ]
+
+[lib]
+name = "rmcp_server_kit"
+path = "src/lib.rs"
 
 [package.metadata.docs.rs]
 all-features = true

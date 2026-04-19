@@ -1,8 +1,9 @@
-# Migrating to the standalone `mcpx` crate
+# Migrating to the standalone `rmcp-server-kit` crate
 
-This guide covers moving a downstream project (e.g. `atlassian-mcp` or
-your own MCP server) from an in-repo `path` dependency on `mcpx` to the
-standalone crate.
+This guide covers two migrations:
+
+1. Moving from an in-repo `path` dependency to the standalone crate.
+2. Upgrading from any `0.x` release to `1.0`.
 
 ## 1. Update your `Cargo.toml`
 
@@ -13,22 +14,22 @@ Pin to a tagged release:
 ```toml
 [dependencies]
 # Public mirror (GitHub):
-mcpx = { git = "https://github.com/andrico21/mcpx", tag = "0.9.30", features = ["oauth"] }
+rmcp-server-kit = { git = "https://github.com/andrico21/mcpx", tag = "1.0.0", features = ["oauth"] }
 
 # Internal mirror (GitLab):
-# mcpx = { git = "[REDACTED]", tag = "0.9.30", features = ["oauth"] }
+# rmcp-server-kit = { git = "[REDACTED]", tag = "1.0.0", features = ["oauth"] }
 ```
 
 ### crates.io dependency (stable / production)
 
-Use a caret range so patch releases flow in automatically:
+Use a caret range so patch and minor releases flow in automatically:
 
 ```toml
 [dependencies]
-mcpx = { version = "0.9", features = ["oauth"] }
+rmcp-server-kit = { version = "1", features = ["oauth"] }
 ```
 
-Avoid the exact-version pin (`version = "=0.9.30"`); it prevents security
+Avoid the exact-version pin (`version = "=1.0.0"`); it prevents security
 patches from reaching your build.
 
 ## 2. Remove the workspace member
@@ -49,8 +50,8 @@ procedure.
 
 ## 3. Keep workspace-level lints in sync
 
-`mcpx` previously inherited `[workspace.lints.*]` from your root
-`Cargo.toml`. After extraction, `mcpx` owns its own lint table; the
+`rmcp-server-kit` previously inherited `[workspace.lints.*]` from your root
+`Cargo.toml`. After extraction, `rmcp-server-kit` owns its own lint table; the
 downstream crate keeps (or promotes) its workspace lints independently.
 
 ## 4. Public-API changes
@@ -62,14 +63,14 @@ API. Only stray doc comments and a hardcoded test hostname were scrubbed
 ## 5. Build & verify
 
 ```bash
-cargo update -p mcpx
+cargo update -p rmcp-server-kit
 cargo build --all-features
 cargo test --all-features
 ```
 
 Expected: identical behavior to the pre-split build. If you observe
 different `rmcp` version resolution, pin `rmcp` in your own `Cargo.toml`
-to match the version declared in `mcpx`'s `[dependencies]`.
+to match the version declared in `rmcp-server-kit`'s `[dependencies]`.
 
 ## 6. Feature-flag parity
 
@@ -79,3 +80,84 @@ to match the version declared in `mcpx`'s `[dependencies]`.
 | `metrics` | Exposes a Prometheus registry and `/metrics` endpoint.   |
 
 Both remain opt-in to keep the default dependency footprint small.
+
+---
+
+## Migrating from 0.x to 1.0
+
+`1.0.0` is the first stable release of `rmcp-server-kit`. From this point on the crate
+follows strict [SemVer 2.0.0](https://semver.org/): no breaking changes
+within the `1.x` series.
+
+The `1.0.0` release bundles every breaking change accumulated during the
+`0.x` series. If you are already on `0.13.x`, the upgrade is a no-op other
+than bumping your `Cargo.toml`. If you are on an older `0.x`, review the
+intermediate sections of [`CHANGELOG.md`](../CHANGELOG.md) for the full
+list of behavioural changes.
+
+### Action items
+
+1. **Rename the crate dependency and imports.** The crate was renamed from
+   `mcpx` to `rmcp-server-kit` for the `1.0.0` release. Update both
+   `Cargo.toml` and Rust import paths:
+
+    ```diff
+     [dependencies]
+    -mcpx = { version = "1", features = ["oauth"] }
+    +rmcp-server-kit = { version = "1", features = ["oauth"] }
+
+    -use mcpx::transport::serve;
+    +use rmcp_server_kit::transport::serve;
+    ```
+
+2. **Bump the dependency.** Switch to caret-`1` to receive future
+    `1.x.y` patches and minor releases automatically:
+
+    ```toml
+    rmcp-server-kit = { version = "1", features = ["oauth"] }
+    ```
+
+3. **Re-run your build & tests.** Most downstream crates need no source
+   changes:
+
+    ```bash
+    cargo update -p rmcp-server-kit
+    cargo build --all-features
+    cargo test --all-features
+    ```
+
+4. **Audit deny / warn lint suppressions.** `rmcp-server-kit` 1.0 enforces a stricter
+   lint set internally; if you copied any `#[allow(...)]` attributes from
+    pre-1.0 rmcp-server-kit source they may now be redundant.
+
+5. **Review your TOML config files** against the schema in
+   [`docs/GUIDE.md`](GUIDE.md#configuration-via-toml). Any field that was
+   removed during the `0.x` series will produce a deserialization error at
+   startup; add or rename as appropriate.
+
+6. **Re-pin compatible versions of `rmcp`, `tokio`, `axum`, `rustls`** to
+   match the versions declared in `rmcp-server-kit 1.0.0`'s `Cargo.toml` if you saw
+   resolver mismatches on `0.x`.
+
+### What does *not* change
+
+- Public module layout (`rmcp_server_kit::transport`, `rmcp_server_kit::auth`, `rmcp_server_kit::rbac`,
+  `rmcp_server_kit::oauth`, `rmcp_server_kit::metrics`, `rmcp_server_kit::tool_hooks`, ...).
+- Crate-root re-exports (`rmcp_server_kit::McpxError`, `rmcp_server_kit::Result`).
+- The `serve()` / `serve_stdio()` entry-point signatures.
+- Cargo feature names (`oauth`, `metrics`).
+- The MCP wire protocol — `rmcp-server-kit 1.x` continues to track the latest
+  stable Streamable HTTP transport from `rmcp`.
+
+### Forward compatibility
+
+Within `1.x`:
+
+- New methods may be added to `#[non_exhaustive]` structs and enums.
+- New variants may be added to `#[non_exhaustive]` enums.
+- New optional Cargo features may be introduced.
+
+These are explicitly **not** breaking under our SemVer policy. If you
+match exhaustively on a non-exhaustive type or rely on a struct's exact
+field set, expect to add a wildcard arm or use one of the constructor
+helpers documented in the GUIDE.

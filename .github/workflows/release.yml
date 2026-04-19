@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "mcpx") | .version')
+            | jq -r '.packages[] | select(.name == "rmcp-server-kit") | .version')
           if [ "$TAG" != "$CRATE_VERSION" ]; then
             echo "::error::git tag $TAG does not match Cargo.toml version $CRATE_VERSION"
             exit 1

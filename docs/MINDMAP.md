@@ -1,8 +1,8 @@
-# mcpx — Project Mindmap
+# rmcp-server-kit — Project Mindmap
 
-> Visual map of the `mcpx` crate. Pair with [`AGENTS.md`](../AGENTS.md) and
+> Visual map of the `rmcp-server-kit` crate. Pair with [`AGENTS.md`](../AGENTS.md) and
 > [`ARCHITECTURE.md`](ARCHITECTURE.md). All file:line references use the
-> code as of `mcpx` v0.9.30.
+> code as of `rmcp-server-kit` v0.9.30.
 
 ---
 
@@ -10,7 +10,7 @@
 
 ```mermaid
 mindmap
-  root((mcpx<br/>v0.9.30))
+  root((rmcp-server-kit<br/>v0.9.30))
     Identity
       Library crate
       No src/main.rs
@@ -20,7 +20,7 @@ mindmap
       Repos
         GitHub andrico21/mcpx
         GitHub mirror
-        crates.io mcpx
+        crates.io rmcp-server-kit
     Purpose
       Reusable framework
       MCP servers in Rust
