@@ -8,7 +8,7 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
-## [0.13.0] - unreleased
+## [0.13.0] - 2026-04-19
 
 ### Changed
 
