@@ -585,6 +585,11 @@ impl JwksCache {
         let mut http_builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
 
         if let Some(ref ca_path) = config.ca_cert_path {
+            // Pre-startup blocking I/O — runs before the runtime begins
+            // serving requests, so blocking the current thread here is
+            // intentional. Do not wrap in `spawn_blocking`: the constructor
+            // is synchronous by contract and is called from `serve()`'s
+            // pre-startup phase.
             let pem = std::fs::read(ca_path)?;
             let cert = reqwest::tls::Certificate::from_pem(&pem)?;
             http_builder = http_builder.add_root_certificate(cert);

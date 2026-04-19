@@ -10,6 +10,51 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
+### Changed
+
+- **CI:** `cargo-audit` job now installs `cargo-audit` and runs
+  `cargo generate-lockfile` before auditing, so the workflow no longer
+  requires a committed `Cargo.lock` (libraries `.gitignore` it per the
+  Cargo FAQ). Functionally equivalent to the previous
+  `rustsec/audit-check` action.
+- **CI:** `Benchmark thresholds` job now passes the required
+  `<bench_hooked> <bench_bare> <max_overhead_ns>` arguments to
+  `scripts/check-bench-overhead.sh`. The job was previously a no-op
+  (script exited 2 with usage error), masked by `continue-on-error`.
+- **Tests:** `shutdown_timeout_honored_on_first_signal` no longer races
+  on a fixed `100ms` sleep; the `/slow` handler now signals via a
+  `tokio::sync::oneshot` when it begins serving and the test waits up
+  to 5s on that signal before triggering shutdown. Eliminates flakiness
+  on slow CI runners.
+- **Docs:** `src/observability.rs::open_audit_file` documents the
+  external log-rotation expectation (logrotate / newsyslog with
+  copytruncate) and the absence of any built-in SIGHUP-style reopen.
+- **Docs:** `src/oauth.rs::JwksCache::new` annotates the synchronous
+  `std::fs::read` of the CA bundle as intentional pre-startup blocking
+  I/O.
+- **Docs:** `deny.toml` documents the cargo-deny v2 policy posture and
+  why the deprecated v1 keys (`vulnerability`, `unmaintained`,
+  `notice`) are intentionally absent.
+
+### Added
+
+- (no public API additions in this patch — the originally proposed
+  `clippy::string_to_string` lint was dropped because upstream clippy
+  has removed it; the broader `clippy::implicit_clone` lint was already
+  enabled at the crate level and covers the same regressions.)
+
+### Fixed
+
+- Non-`oauth`-feature builds no longer warn about the unused
+  `AuthFailureClass::ExpiredCredential` variant or the
+  `unauthorized_response` parameter `fail`.
+- `examples/oauth_server.rs` is now gated on the `oauth` cargo feature
+  (was unconditionally compiled and broke `cargo test` without
+  features).
+- Fixed two broken markdown links in `docs/RUST_1_95_NOTES.md`
+  (`../atlassian-mcp/...` → `../src/`, `../CLAUDE.md` →
+  `../AGENTS.md`).
+
 ## [1.0.0] - 2026-04-19
 
 - **Renamed crate from `mcpx` to `rmcp-server-kit`** (the `mcpx` name on crates.io was already taken by an unrelated project). Library import path is now `use rmcp_server_kit::...`. The `mcpx` GitHub repository name is unchanged.

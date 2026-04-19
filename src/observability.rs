@@ -156,6 +156,17 @@ impl std::io::Write for AuditFileWriter {
 /// Open the audit log file for appending.
 ///
 /// Returns an optional writer and any warnings encountered while preparing it.
+///
+/// # Log rotation
+///
+/// The writer opens the file in append mode and holds a long-lived handle
+/// for the lifetime of the process. There is **no** built-in rotation, no
+/// SIGHUP-style reopen, and no compression. Operators are expected to use
+/// an external rotator such as `logrotate` (Linux) or `newsyslog` (BSD /
+/// macOS) configured with `copytruncate` (or equivalent) so the inode this
+/// handle points at is preserved across rotations. If the rotator instead
+/// renames + recreates the file, this writer will keep writing to the
+/// renamed (rotated) inode until the process restarts.
 fn open_audit_file(path: &Path) -> (Option<AuditFile>, Vec<String>) {
     let mut warnings = Vec::new();
 

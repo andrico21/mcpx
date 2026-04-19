@@ -1,6 +1,14 @@
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
+# Policy posture (cargo-deny v2 schema):
+#   - vulnerabilities: deny by default (an advisory entry triggers a hard
+#     failure unless explicitly listed in `ignore` below);
+#   - unmaintained / notice / unsound: warn by default;
+#   - yanked: deny (above).
+# The deprecated `vulnerability`/`unmaintained`/`notice` keys from cargo-deny
+# v1 are intentionally not set — v2 emits warnings for them.
+#
 # See .cargo/audit.toml for the rationale behind each ignored advisory.
 # RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa` 0.9.x (no upstream
 #   fix; rmcp-server-kit validates JWTs with public keys only, not vulnerable).
