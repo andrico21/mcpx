@@ -48,5 +48,5 @@ async fn main() -> mcpx::Result<()> {
     .with_request_timeout(std::time::Duration::from_secs(30))
     .enable_request_header_logging();
 
-    serve(config, || MinimalHandler).await
+    serve(config.validate()?, || MinimalHandler).await
 }

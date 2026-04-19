@@ -133,7 +133,7 @@ async fn spawn_server(config: McpServerConfig) -> ServerHarness {
     let join = tokio::spawn(async move {
         mcpx::transport::serve_with_listener(
             listener,
-            config,
+            config.validate().expect("test config valid"),
             || TestHandler,
             Some(ready_tx),
             Some(shutdown_for_server),
@@ -884,9 +884,11 @@ async fn builder_matches_direct_field_assignment() {
 }
 
 /// `enable_admin` without a corresponding `with_auth(...).enabled = true`
-/// must be rejected by `validate()` as `McpxError::Config`. This mirrors
-/// the previous runtime check and prevents accidentally exposing
-/// `/admin/*` without authentication.
+/// must be rejected by `validate()` as `McpxError::Config`. With the
+/// typestate `Validated<McpServerConfig>` proof token, `serve()` cannot
+/// even be called with an invalid config -- the rejection happens at
+/// `validate()` time, statically preventing exposing `/admin/*` without
+/// authentication.
 #[tokio::test]
 async fn validate_rejects_admin_without_auth() {
     let cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1").enable_admin("admin");
@@ -895,14 +897,6 @@ async fn validate_rejects_admin_without_auth() {
         matches!(err, mcpx::McpxError::Config(ref msg) if msg.contains("admin")),
         "expected McpxError::Config mentioning admin, got: {err}"
     );
-
-    // serve() must surface the same error early, before binding.
-    let res = mcpx::transport::serve(
-        McpServerConfig::new("127.0.0.1:0", "test", "0.0.1").enable_admin("admin"),
-        || TestHandler,
-    )
-    .await;
-    assert!(matches!(res, Err(mcpx::McpxError::Config(_))));
 }
 
 /// Setting only the TLS cert (or only the key) must be rejected by
@@ -1025,7 +1019,7 @@ async fn hooked_handler_serves_healthz() {
     let join = tokio::spawn(async move {
         mcpx::transport::serve_with_listener(
             listener,
-            cfg,
+            cfg.validate().expect("test config valid"),
             move || with_hooks(TestHandler, Arc::clone(&hooks_for_factory)),
             Some(ready_tx),
             Some(shutdown_for_server),

@@ -18,7 +18,7 @@ handles everything else.
 
 ```toml
 [dependencies]
-mcpx = { version = "0.12", features = ["oauth"] }
+mcpx = { version = "0.13", features = ["oauth"] }
 rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```
@@ -43,7 +43,7 @@ async fn main() -> mcpx::Result<()> {
     let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
         .with_request_timeout(std::time::Duration::from_secs(30))
         .enable_request_header_logging();
-    serve(config, || MyHandler).await
+    serve(config.validate()?, || MyHandler).await
 }
 ```
 

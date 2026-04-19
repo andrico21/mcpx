@@ -256,6 +256,100 @@ pub struct McpServerConfig {
     pub metrics_bind: String,
 }
 
+/// Marker that wraps a value proven to satisfy its validation
+/// contract.
+///
+/// The only way to obtain `Validated<McpServerConfig>` is by calling
+/// [`McpServerConfig::validate`], which is the contract enforced at
+/// the type level by [`serve`] and [`serve_with_listener`]. The
+/// inner field is private, so downstream code cannot bypass
+/// validation by hand-constructing the wrapper.
+///
+/// `Validated<T>` derefs to `&T` for read-only access. To mutate,
+/// recover the raw value with [`Validated::into_inner`] and
+/// re-validate.
+///
+/// # Example
+///
+/// ```no_run
+/// use mcpx::transport::{McpServerConfig, Validated, serve};
+/// use rmcp::handler::server::ServerHandler;
+/// use rmcp::model::{ServerCapabilities, ServerInfo};
+///
+/// #[derive(Clone)]
+/// struct H;
+/// impl ServerHandler for H {
+///     fn get_info(&self) -> ServerInfo {
+///         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+///     }
+/// }
+///
+/// # async fn example() -> mcpx::Result<()> {
+/// let config: Validated<McpServerConfig> =
+///     McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0").validate()?;
+/// serve(config, || H).await
+/// # }
+/// ```
+///
+/// Forgetting `.validate()?` is a compile error:
+///
+/// ```compile_fail
+/// use mcpx::transport::{McpServerConfig, serve};
+/// use rmcp::handler::server::ServerHandler;
+/// use rmcp::model::{ServerCapabilities, ServerInfo};
+///
+/// #[derive(Clone)]
+/// struct H;
+/// impl ServerHandler for H {
+///     fn get_info(&self) -> ServerInfo {
+///         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+///     }
+/// }
+///
+/// # async fn example() -> mcpx::Result<()> {
+/// let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0");
+/// // Missing `.validate()?` -> mismatched types: expected
+/// // `Validated<McpServerConfig>`, found `McpServerConfig`.
+/// serve(config, || H).await
+/// # }
+/// ```
+#[allow(
+    missing_debug_implementations,
+    reason = "wraps T which may not implement Debug; manual impl below avoids leaking inner contents into logs"
+)]
+pub struct Validated<T>(T);
+
+impl<T> std::fmt::Debug for Validated<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Validated").finish_non_exhaustive()
+    }
+}
+
+impl<T> Validated<T> {
+    /// Borrow the inner value.
+    #[must_use]
+    pub fn as_inner(&self) -> &T {
+        &self.0
+    }
+
+    /// Recover the raw value, discarding the validation proof.
+    ///
+    /// Re-validate before re-using the value with [`serve`] or
+    /// [`serve_with_listener`].
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> std::ops::Deref for Validated<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 #[allow(
     deprecated,
     reason = "internal builders/validators legitimately read/write the deprecated `pub` fields they were designed to manage"
@@ -265,9 +359,9 @@ impl McpServerConfig {
     /// server name, and version. All other fields use safe defaults.
     ///
     /// Use the chainable `with_*` / `enable_*` builder methods to
-    /// customize. Call [`McpServerConfig::validate`] before passing to
-    /// [`serve`] to surface configuration errors early; [`serve`] and
-    /// [`serve_with_listener`] also invoke `validate()` internally.
+    /// customize. Call [`McpServerConfig::validate`] to obtain a
+    /// [`Validated<McpServerConfig>`] proof token, which is required by
+    /// [`serve`] and [`serve_with_listener`].
     #[must_use]
     pub fn new(
         bind_addr: impl Into<String>,
@@ -491,9 +585,11 @@ impl McpServerConfig {
         self
     }
 
-    /// Validate the configuration. Called automatically by [`serve`] and
-    /// [`serve_with_listener`]; callers may invoke it early to surface
-    /// configuration mistakes before binding sockets.
+    /// Validate the configuration and consume `self`, returning a
+    /// [`Validated<McpServerConfig>`] proof token required by [`serve`]
+    /// and [`serve_with_listener`]. This is the only way to construct
+    /// `Validated<McpServerConfig>`, so the type system guarantees
+    /// validation has run before the server starts.
     ///
     /// Checks:
     ///
@@ -510,7 +606,15 @@ impl McpServerConfig {
     ///
     /// Returns [`McpxError::Config`] with a human-readable message on
     /// the first validation failure.
-    pub fn validate(&self) -> Result<(), McpxError> {
+    pub fn validate(self) -> Result<Validated<Self>, McpxError> {
+        self.check()?;
+        Ok(Validated(self))
+    }
+
+    /// Run the validation checks without consuming `self`. Used by
+    /// internal call sites (e.g. tests) that need to inspect a config
+    /// without taking ownership.
+    fn check(&self) -> Result<(), McpxError> {
         // 1. admin <-> auth dependency. Mirrors the runtime check in
         //    `build_app_router`: admin endpoints require an auth state,
         //    which is built only when `auth` is `Some` *and* `enabled`.
@@ -1117,17 +1221,24 @@ where
 /// deterministic shutdown control (e.g. integration tests), see
 /// [`serve_with_listener`].
 ///
+/// The configuration must be validated first via
+/// [`McpServerConfig::validate`], which returns a [`Validated`] proof
+/// token. This typestate guarantees, at compile time, that the server
+/// never starts with an invalid configuration.
+///
 /// # Errors
 ///
-/// Returns [`McpxError::Startup`] if router construction fails (invalid
-/// auth/admin/OAuth configuration), if binding to `config.bind_addr`
+/// Returns [`McpxError::Startup`] if binding to `config.bind_addr`
 /// fails, or if the underlying axum server returns an error.
-pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> Result<(), McpxError>
+pub async fn serve<H, F>(
+    config: Validated<McpServerConfig>,
+    handler_factory: F,
+) -> Result<(), McpxError>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
-    config.validate()?;
+    let config = config.into_inner();
     #[allow(
         deprecated,
         reason = "internal serve() reads `bind_addr` to construct the listener; field becomes pub(crate) in 1.0"
@@ -1183,7 +1294,7 @@ where
 /// server returns an error.
 pub async fn serve_with_listener<H, F>(
     listener: TcpListener,
-    config: McpServerConfig,
+    config: Validated<McpServerConfig>,
     handler_factory: F,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
     shutdown: Option<CancellationToken>,
@@ -1192,7 +1303,7 @@ where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
-    config.validate()?;
+    let config = config.into_inner();
     let local_addr = listener
         .local_addr()
         .map_err(|e| io_to_startup("listener.local_addr", e))?;
@@ -2061,6 +2172,23 @@ mod tests {
         assert_eq!(cfg.request_timeout, Duration::from_mins(2));
         assert_eq!(cfg.shutdown_timeout, Duration::from_secs(30));
         assert!(!cfg.log_request_headers);
+    }
+
+    #[test]
+    fn validate_consumes_and_proves() {
+        // Valid config -> Validated wrapper, original is consumed.
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
+        let validated = cfg.validate().expect("valid config");
+        // Deref gives read-only access to inner fields.
+        assert_eq!(validated.name, "test-server");
+        // into_inner recovers the raw value.
+        let raw = validated.into_inner();
+        assert_eq!(raw.name, "test-server");
+
+        // Invalid config (zero max_request_body) -> Err.
+        let mut bad = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
+        bad.max_request_body = 0;
+        assert!(bad.validate().is_err(), "zero body cap must fail validate");
     }
 
     #[test]

@@ -12,6 +12,26 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ### Changed
 
+- **[H-B4] `serve()` and `serve_with_listener()` require `Validated<McpServerConfig>`** *(breaking)*.
+  `McpServerConfig::validate()` now consumes `self` and returns
+  `Result<Validated<McpServerConfig>, McpxError>`. The new
+  `Validated<T>` wrapper is a typestate proof token: the only way to
+  obtain `Validated<McpServerConfig>` is by calling `validate()`. This
+  makes invalid server starts a *compile-time* error rather than a
+  runtime one. `Validated<T>` derefs to `&T` for read-only access; use
+  `.into_inner()` to recover the raw value (and re-validate before
+  re-using). **Migration**:
+
+  ```rust
+  // Before (0.12.0)
+  let config = McpServerConfig::new(...);
+  serve(config, || MyHandler).await?;
+
+  // After (0.13.0)
+  let config = McpServerConfig::new(...);
+  serve(config.validate()?, || MyHandler).await?;
+  ```
+
 - **[H-B1] OAuth handler signatures take `OauthHttpClient` instead of
   `reqwest::Client`** *(breaking)*. The public functions
   `oauth::handle_token`, `oauth::handle_introspect`,

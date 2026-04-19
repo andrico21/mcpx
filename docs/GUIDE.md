@@ -67,7 +67,7 @@ async fn main() -> mcpx::Result<()> {
     let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
         .with_request_timeout(std::time::Duration::from_secs(30))
         .enable_request_header_logging();
-    serve(config, || MyHandler).await
+    serve(config.validate()?, || MyHandler).await
 }
 ```
 
@@ -1079,7 +1079,7 @@ async fn main() -> mcpx::Result<()> {
     // config.tls_cert_path = Some("/etc/certs/server.crt".into());
     // config.tls_key_path = Some("/etc/certs/server.key".into());
 
-    serve(config, || MyHandler).await
+    serve(config.validate()?, || MyHandler).await
 }
 ```
 
@@ -1310,7 +1310,7 @@ async fn spawn_test_server(config: McpServerConfig) -> String {
     let base = format!("http://127.0.0.1:{port}");
 
     tokio::spawn(async move {
-        let _ = serve(config, || MyHandler).await;
+        let _ = serve(config.validate().expect("test config valid"), || MyHandler).await;
     });
 
     // Wait for startup
