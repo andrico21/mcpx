@@ -18,7 +18,7 @@ mindmap
       MSRV 1.95.0
       Dual MIT / Apache-2.0
       Repos
-        GitHub andrico21/mcpx
+        GitHub andrico21/rmcp-server-kit
         GitHub mirror
         crates.io rmcp-server-kit
     Purpose

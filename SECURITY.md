@@ -19,7 +19,7 @@ issues.**
 Instead, use **GitHub Security Advisories** (private vulnerability
 reporting) on the public repository:
 
-<https://github.com/andrico21/mcpx/security/advisories/new>
+<https://github.com/andrico21/rmcp-server-kit/security/advisories/new>
 
 Users of the internal mirror at
 `[REDACTED]` may alternatively open a

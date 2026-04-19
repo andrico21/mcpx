@@ -14,7 +14,7 @@ Pin to a tagged release:
 ```toml
 [dependencies]
 # Public mirror (GitHub):
-rmcp-server-kit = { git = "https://github.com/andrico21/mcpx", tag = "1.0.0", features = ["oauth"] }
+rmcp-server-kit = { git = "https://github.com/andrico21/rmcp-server-kit", tag = "1.0.0", features = ["oauth"] }
 
 # Internal mirror (GitLab):
 # rmcp-server-kit = { git = "[REDACTED]", tag = "1.0.0", features = ["oauth"] }
