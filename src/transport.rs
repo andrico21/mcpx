@@ -962,7 +962,7 @@ where
         && let Some(ref oauth_config) = auth_config.oauth
         && oauth_config.proxy.is_some()
     {
-        router = install_oauth_proxy_routes(router, &server_url, oauth_config);
+        router = install_oauth_proxy_routes(router, &server_url, oauth_config)?;
     }
 
     // OWASP security response headers (applied to all responses).
@@ -1335,15 +1335,24 @@ async fn run_server(
 /// Install the OAuth 2.1 proxy endpoints (`/authorize`, `/token`,
 /// `/register`, and authorization server metadata) on `router`. The
 /// caller must ensure `oauth_config.proxy` is `Some`.
+///
+/// # Errors
+///
+/// Returns [`McpxError::Startup`] if the shared
+/// [`crate::oauth::OauthHttpClient`] cannot be initialized.
 #[cfg(feature = "oauth")]
 fn install_oauth_proxy_routes(
     router: axum::Router,
     server_url: &str,
     oauth_config: &crate::oauth::OAuthConfig,
-) -> axum::Router {
+) -> Result<axum::Router, McpxError> {
     let Some(ref proxy) = oauth_config.proxy else {
-        return router;
+        return Ok(router);
     };
+
+    // Single shared HTTP client for all proxy endpoints. Cloning is
+    // cheap (refcounted) and shares the underlying connection pool.
+    let http = crate::oauth::OauthHttpClient::new()?;
 
     let asm = crate::oauth::authorization_server_metadata(server_url, oauth_config);
     let router = router.route(
@@ -1366,7 +1375,7 @@ fn install_oauth_proxy_routes(
     );
 
     let proxy_token = proxy.clone();
-    let token_http = reqwest::Client::new();
+    let token_http = http.clone();
     let router = router.route(
         "/token",
         axum::routing::post(move |body: String| {
@@ -1387,7 +1396,7 @@ fn install_oauth_proxy_routes(
 
     let router = if proxy.expose_admin_endpoints && proxy.introspection_url.is_some() {
         let proxy_introspect = proxy.clone();
-        let introspect_http = reqwest::Client::new();
+        let introspect_http = http.clone();
         router.route(
             "/introspect",
             axum::routing::post(move |body: String| {
@@ -1402,7 +1411,7 @@ fn install_oauth_proxy_routes(
 
     let router = if proxy.expose_admin_endpoints && proxy.revocation_url.is_some() {
         let proxy_revoke = proxy.clone();
-        let revoke_http = reqwest::Client::new();
+        let revoke_http = http;
         router.route(
             "/revoke",
             axum::routing::post(move |body: String| {
@@ -1420,7 +1429,7 @@ fn install_oauth_proxy_routes(
         revoke = proxy.expose_admin_endpoints && proxy.revocation_url.is_some(),
         "OAuth 2.1 proxy endpoints enabled (/authorize, /token, /register)"
     );
-    router
+    Ok(router)
 }
 
 /// Build the host allow-list for rmcp's DNS rebinding protection.

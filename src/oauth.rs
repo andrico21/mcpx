@@ -26,6 +26,48 @@ use tokio::sync::RwLock;
 use crate::auth::{AuthIdentity, AuthMethod};
 
 // ---------------------------------------------------------------------------
+// HTTP client wrapper
+// ---------------------------------------------------------------------------
+
+/// HTTP client used by [`exchange_token`] and the OAuth 2.1 proxy
+/// handlers ([`handle_token`], [`handle_introspect`], [`handle_revoke`]).
+///
+/// Wraps an internal HTTP backend so callers do not depend on the
+/// concrete crate. Construct one per process and reuse across requests
+/// (the underlying connection pool is shared internally via
+/// [`Clone`] - cheap, refcounted).
+#[derive(Clone)]
+pub struct OauthHttpClient {
+    inner: reqwest::Client,
+}
+
+impl OauthHttpClient {
+    /// Build a client with sensible defaults: 10s connect timeout,
+    /// 30s total timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::McpxError::Startup`] if the underlying
+    /// HTTP client cannot be constructed (e.g. TLS backend init failure).
+    pub fn new() -> Result<Self, crate::error::McpxError> {
+        let inner = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
+            })?;
+        Ok(Self { inner })
+    }
+}
+
+impl std::fmt::Debug for OauthHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OauthHttpClient").finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -1104,7 +1146,7 @@ pub fn handle_authorize(proxy: &OAuthProxyConfig, query: &str) -> axum::response
 /// grant) to the upstream token endpoint, injecting client credentials
 /// when configured (confidential client). Returns the upstream response as-is.
 pub async fn handle_token(
-    http: &reqwest::Client,
+    http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
     body: &str,
 ) -> axum::response::Response {
@@ -1129,6 +1171,7 @@ pub async fn handle_token(
     }
 
     let result = http
+        .inner
         .post(&proxy.token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(upstream_body)
@@ -1190,7 +1233,7 @@ pub fn handle_register(proxy: &OAuthProxyConfig, body: &serde_json::Value) -> se
 /// injecting client credentials when configured. Returns the upstream
 /// response as-is.  Requires `proxy.introspection_url` to be `Some`.
 pub async fn handle_introspect(
-    http: &reqwest::Client,
+    http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
     body: &str,
 ) -> axum::response::Response {
@@ -1211,7 +1254,7 @@ pub async fn handle_introspect(
 /// response as-is (per RFC 7009, typically 200 with empty body).
 /// Requires `proxy.revocation_url` to be `Some`.
 pub async fn handle_revoke(
-    http: &reqwest::Client,
+    http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
     body: &str,
 ) -> axum::response::Response {
@@ -1229,7 +1272,7 @@ pub async fn handle_revoke(
 /// `client_secret` (when configured) and forwards the form-encoded body
 /// upstream, returning the upstream status/body verbatim.
 async fn proxy_oauth_admin_request(
-    http: &reqwest::Client,
+    http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
     upstream_url: &str,
     body: &str,
@@ -1252,6 +1295,7 @@ async fn proxy_oauth_admin_request(
     }
 
     let result = http
+        .inner
         .post(upstream_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(upstream_body)
@@ -1323,13 +1367,14 @@ struct OAuthErrorResponse {
 /// Returns an error if the HTTP request fails, the authorization
 /// server rejects the exchange, or the response cannot be parsed.
 pub async fn exchange_token(
-    http: &reqwest::Client,
+    http: &OauthHttpClient,
     config: &TokenExchangeConfig,
     subject_token: &str,
 ) -> Result<ExchangedToken, crate::error::McpxError> {
     use secrecy::ExposeSecret;
 
     let mut req = http
+        .inner
         .post(&config.token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json");
@@ -2261,13 +2306,11 @@ mod tests {
 
     /// Build an HTTP client for tests. Ensures a rustls crypto provider
     /// is installed (normally done inside `JwksCache::new`).
-    fn test_http_client() -> reqwest::Client {
+    fn test_http_client() -> OauthHttpClient {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        reqwest::Client::builder()
-            .build()
-            .expect("build test http client")
+        OauthHttpClient::new().expect("build test http client")
     }
 
     #[tokio::test]

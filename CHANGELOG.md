@@ -10,6 +10,24 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ## [0.13.0] - unreleased
 
+### Changed
+
+- **[H-B1] OAuth handler signatures take `OauthHttpClient` instead of
+  `reqwest::Client`** *(breaking)*. The public functions
+  `oauth::handle_token`, `oauth::handle_introspect`,
+  `oauth::handle_revoke`, and `oauth::exchange_token` now accept
+  `&oauth::OauthHttpClient` (a thin wrapper around the underlying HTTP
+  backend) instead of leaking `reqwest::Client` through the public API.
+  This decouples downstream crates from the `reqwest` version mcpx
+  pins. Construct via `OauthHttpClient::new()` (10s connect / 30s
+  total timeout). The wrapper is `Clone` (cheap, refcounted) and
+  `Debug` (opaque). Internally, `install_oauth_proxy_routes` now
+  builds one shared client and clones it across `/token`,
+  `/introspect`, and `/revoke` instead of constructing three
+  independent pools. **Migration**: replace
+  `reqwest::Client::new()` with `mcpx::oauth::OauthHttpClient::new()?`
+  at OAuth proxy / token-exchange call sites.
+
 ### Deprecated
 
 - **[H-B3] Direct field access on `McpServerConfig` is deprecated.** All
