@@ -187,19 +187,23 @@ token exchange, the optional `/authorize`/`/token`/`/register`/
 
 #### Trust boundary on OAuth endpoint URLs
 
-The `oauth.issuer_url`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
+The `oauth.issuer`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
 URLs are treated as **operator-trusted configuration**, not as
-attacker-supplied input. As of **1.3.0**, the OAuth fetcher enforces a
-strict per-hop DNS/private-IP SSRF guard (shared with the CRL fetcher).
-The validate-time check rejects userinfo and ALL literal IP hosts (operators 
-must use DNS hostnames for the 6 OAuth URL fields). The runtime per-hop 
-redirect guard rejects userinfo and literal IPs in forbidden ranges 
-(private/loopback/link-local/metadata).
+attacker-supplied input. As of **1.3.0**, OAuth URL hardening operates
+in two layers: `OAuthConfig::validate` rejects userinfo and ALL literal
+IP hosts across the six configured URL fields (operators must use DNS
+hostnames), and a sync per-hop SSRF range guard runs inside both the
+`OauthHttpClient` and `JwksCache` redirect closures, rejecting targets
+that resolve to private, loopback, link-local, multicast, broadcast,
+unspecified, or cloud-metadata IP ranges. `https -> http` redirect
+downgrades are always rejected; `http -> http` is permitted only when
+`allow_http_oauth_urls = true`. This release does not add an async
+DNS-resolution guard on the initial (non-redirect) OAuth request.
 
 Implications:
 
 - Do **not** allow tenants or end-users to influence
-  `oauth.issuer_url` / `oauth.jwks_uri` / discovery URLs at runtime.
+  `oauth.issuer` / `oauth.jwks_uri` / discovery URLs at runtime.
 - A compromised IdP cannot reach internal hosts behind the SSRF guard,
   but can still trigger HTTPS GETs to any public host reachable from
   the deployment. Combine with strict egress firewalling for

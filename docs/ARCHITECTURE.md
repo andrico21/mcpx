@@ -253,7 +253,7 @@ Generic wrapper around a consumer's `ServerHandler` that runs:
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache: Option<Arc<JwksCache>>` (`src/oauth.rs:460-481`) when `feature=oauth` is on and `oauth.issuer_url` is configured
+- `jwks_cache: Option<Arc<JwksCache>>` (`src/oauth.rs:460-481`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
@@ -428,14 +428,31 @@ Failure modes:
 
 ### SSRF hardening (since 1.2.1/1.3.0)
 
-`ssrf_guard` (now in its own `ssrf` module, `src/ssrf.rs`) runs against
-every outbound HTTP URL *before* the request is issued. It rejects:
-- non-`http(s)` schemes
-- URLs with userinfo
-- any host that resolves to a private/loopback/link-local/multicast/
-  unspecified/broadcast/cloud-metadata address (IPv4 and IPv6).
+The shared SSRF helpers live in `src/ssrf.rs` and split into two layers:
 
-As of **1.3.0**, this guard covers **both CRL and OAuth traffic**.
+- **Validate-time blanket guard** (`check_url_literal_ip`, used by
+  `OAuthConfig::validate` and CRL config validation): rejects any URL that
+  uses a literal IPv4/IPv6 host or that contains userinfo. Operators must
+  use DNS hostnames in configuration.
+- **Runtime per-hop guard** (`redirect_target_reason`, called from inside
+  the `OauthHttpClient`, `JwksCache`, and CRL redirect closures): rejects
+  targets resolving to private, loopback, link-local, multicast,
+  broadcast, unspecified, or cloud-metadata IP ranges. Public IPs are
+  permitted because legitimate DNS resolution may yield them. The closures
+  are sync (no async DNS inside policy).
+
+For OAuth specifically, 1.3.0 covers:
+- All six configured URL fields at startup (`issuer`, `jwks_uri`,
+  `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
+  `introspection_endpoint`) — userinfo + literal-IP rejection.
+- Both OAuth client redirect closures (`OauthHttpClient::build` and
+  `JwksCache::new`) — runtime per-hop range guard plus
+  `https -> http` downgrade rejection and `http -> http` gating on
+  `allow_http_oauth_urls`.
+
+1.3.0 does **not** add an async DNS-resolution guard on the initial
+(non-redirect) OAuth request itself — the validate-time blanket
+literal-IP rejection is the trust anchor for operator-supplied URLs.
 
 Additionally, several knobs cap the blast radius even when a host is
 reachable:
@@ -528,7 +545,7 @@ These let downstream MCP clients discover OAuth via the same origin as
 
 ### Trust boundary (1.3.x)
 
-OAuth endpoint URLs (`issuer_url`, `jwks_uri`, discovery URLs) are
+OAuth endpoint URLs (`issuer`, `jwks_uri`, discovery URLs) are
 **operator-trusted configuration**. As of **1.3.0**, these URLs are
 subject to strict validation and an SSRF guard, but operators must still
 ensure they point to intended, authenticated Identity Providers.

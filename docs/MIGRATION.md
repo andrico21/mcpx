@@ -85,17 +85,31 @@ Both remain opt-in to keep the default dependency footprint small.
 resilience. While there are no breaking public-API changes, several new
 resource caps and an SSRF guard are now active by default.
 
-### Universal SSRF guard on outbound HTTP
+### OAuth URL hardening and per-hop redirect SSRF guard
 
-The per-hop DNS/private-IP SSRF guard previously introduced for CRL fetches
-in 1.2.1 is now **enforced across all OAuth-bound HTTP traffic** (JWKS
-fetching, token exchange, introspection, and revocation).
+OAuth URL hardening operates in two layers:
 
-Any outbound request (including redirects) that resolves to a
-private/loopback/link-local/metadata address will now fail with an 
-internal error (logged as a security failure; matches the pre-B3
-Oracle findings). This matches the threat model where Identity Providers are
-untrustworthy for the purpose of internal network discovery.
+- **At config-construction time**, `OAuthConfig::validate` rejects any of
+  the six configured URL fields (`issuer`, `jwks_uri`,
+  `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
+  `introspection_endpoint`) that contain HTTP userinfo (`user:pass@host`)
+  or that use a literal IP host (IPv4 or IPv6). Operators must use DNS
+  hostnames.
+- **At runtime, on every HTTP redirect hop**, both the shared
+  `OauthHttpClient` and the `JwksCache` redirect closures run a sync
+  per-hop SSRF guard that rejects targets resolving to private, loopback,
+  link-local, multicast, broadcast, unspecified, or cloud-metadata IP
+  ranges. `https -> http` downgrades are always rejected; `http -> http`
+  is permitted only when `allow_http_oauth_urls = true`.
+
+A redirect that violates either the scheme policy or the per-hop range
+guard fails the underlying `reqwest` call; on the OAuth path this surfaces
+as an HTTP 500 with `"failed to fetch ..."` and the rejection reason is
+emitted as a `WARN` log line.
+
+This release does **not** add an async DNS-resolution guard on the
+initial (non-redirect) OAuth request itself — the validate-time blanket
+literal-IP rejection is the trust anchor for operator-supplied URLs.
 
 ### OAuth hardening: URL validation and JWKS caps
 
@@ -132,8 +146,10 @@ upward.
 1. `cargo update -p rmcp-server-kit` (or bump the pin to `"1.3.0"`).
 2. If you use mTLS with a very high number of distinct CRL sources, review
    the new `crl_max_*` caps.
-3. If you use OAuth, verify your `issuer_url` and `jwks_uri` do not use
-   IP literals (use DNS names instead).
+3. If you use OAuth, verify your `issuer` and `jwks_uri` (and any of
+   `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
+   `introspection_endpoint` you set) do not use IP literals or contain
+   userinfo (use DNS names instead).
 4. No action required if you do not use mTLS or OAuth.
 
 ---
@@ -185,7 +201,7 @@ affects code that constructed `OauthHttpClient` directly.
 
 ### Trust-boundary clarification for OAuth endpoint URLs
 
-`oauth.issuer_url` / `oauth.jwks_uri` / discovery URLs are treated as
+`oauth.issuer` / `oauth.jwks_uri` / discovery URLs are treated as
 **operator-trusted configuration** in 1.2.x. Per-hop DNS/private-IP
 SSRF guarding for OAuth-bound traffic is deferred to **1.3.0**; in the
 meantime, do not let tenants or end-users influence those URLs at

@@ -853,26 +853,40 @@ scope = "mcp:read"
 role = "viewer"
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `issuer` | `String` | Expected `iss` claim |
-| `audience` | `String` | Expected `aud` claim |
-| `jwks_uri` | `String` | JWKS endpoint URL |
-| `scopes` | `Vec<ScopeMapping>` | OAuth scope -> RBAC role mapping |
-| `jwks_cache_ttl` | `String` | `"10m"` | Cache refresh interval (default: `"10m"`) |
-| `max_jwks_keys` | `usize` | `256` | Max public keys in JWKS (since 1.3.0) |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `issuer` | `String` | -- | Expected `iss` claim. |
+| `audience` | `String` | -- | Expected `aud` claim. |
+| `jwks_uri` | `String` | -- | JWKS endpoint URL. |
+| `scopes` | `Vec<ScopeMapping>` | `[]` | OAuth scope -> RBAC role mapping. |
+| `jwks_cache_ttl` | `String` | `"10m"` | JWKS cache refresh interval. |
+| `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document (since 1.3.0). |
+| `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 
 #### SSRF and DoS Hardening (OAuth)
 
-As of **1.3.0**, the OAuth fetcher enforces a strict per-hop
-DNS/private-IP SSRF guard. It also rejects URLs containing userinfo or
-IP literals.
+As of **1.3.0**, OAuth URL hardening operates in two layers:
+
+- **At config-construction time**, `OAuthConfig::validate` rejects any of
+  the six configured URL fields (`issuer`, `jwks_uri`, `authorization_endpoint`,
+  `token_endpoint`, `revocation_endpoint`, `introspection_endpoint`) that
+  contain HTTP userinfo (`user:pass@host`) or that use a literal IP host
+  (IPv4 or IPv6). Operators must use DNS hostnames.
+- **At runtime, on every HTTP redirect hop**, both the shared
+  `OauthHttpClient` and the `JwksCache` redirect closures run a sync
+  per-hop SSRF guard that rejects targets resolving to private, loopback,
+  link-local, multicast, broadcast, unspecified, or cloud-metadata
+  IP ranges. `https -> http` downgrades are always rejected; `http -> http`
+  is permitted only when `allow_http_oauth_urls = true`.
+
+There is also a fail-closed cap on the JWKS key count:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document. |
-| `oauth_redirect_limit` | `usize` | `10` | Max redirect hops to follow. |
-| `oauth_fetch_timeout` | `Duration` | `30s` | Total timeout for OAuth HTTP requests. |
+
+The redirect-hop limit (max 2) and per-request HTTP timeouts are enforced
+internally and are not configurable knobs in 1.3.0.
 
 ---
 

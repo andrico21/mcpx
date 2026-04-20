@@ -131,7 +131,11 @@ mindmap
           HTTPS to HTTP redirect rejected
           HTTP to HTTP gated by allow_http_oauth_urls
           Trust boundary issuer/jwks operator-only
-          Per-hop SSRF guard deferred to 1.3.0
+          1.3.0 hardening
+            OAuthConfig::validate rejects userinfo and literal IPs across all 6 URL fields incl. issuer
+            Per-hop SSRF range guard on OauthHttpClient and JwksCache redirect closures
+            JwksCache key cap fail-closed default 256
+            Closures stay sync no async DNS
     Middleware order
       outer to inner
       1 Origin check
