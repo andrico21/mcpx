@@ -549,9 +549,21 @@ impl JwksCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA bundle cannot be read or the HTTP client
-    /// cannot be built.
-    pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    /// Returns [`crate::error::McpxError::Io`] if the CA bundle file cannot be
+    /// read, or [`crate::error::McpxError::Config`] if the CA bundle is not
+    /// valid PEM or the underlying HTTP client cannot be built.
+    ///
+    /// # Migration (1.x → 2.0)
+    ///
+    /// The return type changed from
+    /// `Result<Self, Box<dyn std::error::Error + Send + Sync>>` to
+    /// `Result<Self, McpxError>`. Most call sites that propagate via `?`
+    /// into a function returning [`crate::error::McpxError`] (or
+    /// [`crate::Result`]) compile unchanged. Call sites that named the
+    /// boxed error type explicitly must be updated. See
+    /// [`docs/MIGRATION.md`](https://github.com/andrico21/rmcp-server-kit/blob/main/docs/MIGRATION.md)
+    /// for details.
+    pub fn new(config: &OAuthConfig) -> Result<Self, crate::error::McpxError> {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
         // the error if already installed by another call in the same process).
         rustls::crypto::ring::default_provider()
@@ -590,12 +602,16 @@ impl JwksCache {
             // intentional. Do not wrap in `spawn_blocking`: the constructor
             // is synchronous by contract and is called from `serve()`'s
             // pre-startup phase.
-            let pem = std::fs::read(ca_path)?;
-            let cert = reqwest::tls::Certificate::from_pem(&pem)?;
+            let pem = std::fs::read(ca_path)?; // std::io::Error -> McpxError::Io via #[from]
+            let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
+                crate::error::McpxError::Config(format!("OAuth CA bundle is not valid PEM: {e}"))
+            })?;
             http_builder = http_builder.add_root_certificate(cert);
         }
 
-        let http = http_builder.build()?;
+        let http = http_builder.build().map_err(|e| {
+            crate::error::McpxError::Config(format!("OAuth HTTP client build failed: {e}"))
+        })?;
 
         Ok(Self {
             jwks_uri: config.jwks_uri.clone(),
