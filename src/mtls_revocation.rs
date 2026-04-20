@@ -175,9 +175,9 @@ impl CrlSet {
         let cooldown = Duration::from_mins(1);
         let should_warn = match self.last_cap_warn.lock() {
             Ok(mut guard) => {
-                let should_emit = guard.get(which).is_none_or(|last| {
-                    now.saturating_duration_since(*last) >= cooldown
-                });
+                let should_emit = guard
+                    .get(which)
+                    .is_none_or(|last| now.saturating_duration_since(*last) >= cooldown);
                 if should_emit {
                     guard.insert(which, now);
                 }
@@ -185,9 +185,9 @@ impl CrlSet {
             }
             Err(poisoned) => {
                 let mut guard = poisoned.into_inner();
-                let should_emit = guard.get(which).is_none_or(|last| {
-                    now.saturating_duration_since(*last) >= cooldown
-                });
+                let should_emit = guard
+                    .get(which)
+                    .is_none_or(|last| now.saturating_duration_since(*last) >= cooldown);
                 if should_emit {
                     guard.insert(which, now);
                 }
@@ -395,7 +395,10 @@ impl CrlSet {
                 continue;
             }
             // Admission succeeded: now safe to dedup permanently.
-            let mut guard = self.seen_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = self
+                .seen_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.len() >= self.config.crl_max_seen_urls {
                 self.warn_cap_exceeded_throttled("seen_urls");
                 break;

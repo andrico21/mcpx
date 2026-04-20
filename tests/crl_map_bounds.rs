@@ -179,8 +179,9 @@ async fn cache_hard_cap_drops_newest() {
     // Cap cache at 2; attempt to insert 3 distinct successful entries.
     // Only the first two are retained; the third is dropped (newest-
     // rejected, not LRU-evicted).
-    use rmcp_server_kit::mtls_revocation::CachedCrl;
     use std::time::SystemTime;
+
+    use rmcp_server_kit::mtls_revocation::CachedCrl;
 
     let set = empty_crl_set(1024, 4096, 2);
 
@@ -223,8 +224,9 @@ async fn stale_removal_also_clears_seen() {
     // cached entry appear stale beyond the grace window; trigger a
     // refresh that fails; assert BOTH seen_urls and cache drop the
     // URL (current 1.2.1 only drops from cache + cached_urls).
-    use rmcp_server_kit::mtls_revocation::CachedCrl;
     use std::time::{Duration, SystemTime};
+
+    use rmcp_server_kit::mtls_revocation::CachedCrl;
 
     let set = empty_crl_set(1024, 4096, 1024);
     let url = "https://stale.example.test/crl";
