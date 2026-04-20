@@ -153,9 +153,7 @@ impl OauthHttpClient {
                         return attempt.error("redirect to non-HTTP(S) URL refused");
                     }
                 }
-                if dest_scheme == "https"
-                    && let Some(reason) = crate::ssrf::redirect_target_reason(attempt.url())
-                {
+                if let Some(reason) = crate::ssrf::redirect_target_reason(attempt.url()) {
                     return attempt.error(format!("redirect target forbidden: {reason}"));
                 }
                 if attempt.previous().len() >= 2 {
@@ -352,6 +350,12 @@ impl OAuthConfig {
     /// to parse or violates the scheme policy.
     pub fn validate(&self) -> Result<(), crate::error::McpxError> {
         let allow_http = self.allow_http_oauth_urls;
+        let url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
+        if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+            return Err(crate::error::McpxError::Config(format!(
+                "oauth.issuer forbidden ({reason})"
+            )));
+        }
         let url = check_oauth_url("oauth.jwks_uri", &self.jwks_uri, allow_http)?;
         if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
             return Err(crate::error::McpxError::Config(format!(

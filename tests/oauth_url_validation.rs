@@ -7,9 +7,8 @@
 //! * `check_oauth_url` rejects any URL whose `username()` is non-empty or
 //!   whose `password()` is `Some(_)`, returning [`McpxError::Config`].
 //! * `OAuthConfig::validate` additionally runs a new
-//!   `crate::ssrf::check_url_literal_ip` guard that rejects URLs whose
-//!   `host()` resolves to a private / loopback / link-local /
-//!   cloud-metadata IP literal (any canonical form parsed by
+//!   `crate::ssrf::check_url_literal_ip` guard that rejects any literal
+//!   IPv4 or IPv6 host in the URL string (any canonical form parsed by
 //!   [`url::Url`]).
 
 use rmcp_server_kit::oauth::OAuthConfig;
@@ -42,6 +41,56 @@ fn rejects_userinfo_username_password() {
     assert!(
         msg.contains("userinfo") || msg.contains("credentials"),
         "error must mention userinfo rejection; got: {msg}"
+    );
+}
+
+#[test]
+fn issuer_with_userinfo_rejected() {
+    let cfg = OAuthConfig::builder(
+        "https://user:pass@auth.example.com/",
+        "aud",
+        "https://auth.example.com/jwks",
+    )
+    .build();
+    let err = cfg
+        .validate()
+        .expect_err("issuer userinfo must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("userinfo") || msg.contains("credentials"),
+        "error must mention userinfo rejection; got: {msg}"
+    );
+}
+
+#[test]
+fn issuer_with_literal_ipv4_rejected() {
+    let cfg =
+        OAuthConfig::builder("https://192.0.2.1/", "aud", "https://auth.example.com/jwks").build();
+    let err = cfg
+        .validate()
+        .expect_err("literal IPv4 issuer must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("forbidden") || msg.contains("literal") || msg.contains("ip"),
+        "error must mention literal-IP rejection; got: {msg}"
+    );
+}
+
+#[test]
+fn issuer_with_literal_ipv6_rejected() {
+    let cfg = OAuthConfig::builder(
+        "https://[2001:db8::1]/",
+        "aud",
+        "https://auth.example.com/jwks",
+    )
+    .build();
+    let err = cfg
+        .validate()
+        .expect_err("literal IPv6 issuer must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("forbidden") || msg.contains("literal") || msg.contains("ip"),
+        "error must mention literal-IP rejection; got: {msg}"
     );
 }
 
@@ -98,6 +147,32 @@ fn rejects_hex_loopback_jwks() {
     let msg = err.to_string();
     assert!(
         msg.contains("loopback") || msg.contains("forbidden"),
+        "error must mention literal-IP rejection; got: {msg}"
+    );
+}
+
+#[test]
+fn validate_rejects_public_literal_ipv4() {
+    let cfg = cfg_with_jwks("https://8.8.8.8/jwks", false);
+    let err = cfg
+        .validate()
+        .expect_err("public literal IPv4 must be rejected at validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("forbidden") || msg.contains("literal") || msg.contains("ip"),
+        "error must mention literal-IP rejection; got: {msg}"
+    );
+}
+
+#[test]
+fn validate_rejects_public_literal_ipv6() {
+    let cfg = cfg_with_jwks("https://[2001:4860:4860::8888]/jwks", false);
+    let err = cfg
+        .validate()
+        .expect_err("public literal IPv6 must be rejected at validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("forbidden") || msg.contains("literal") || msg.contains("ip"),
         "error must mention literal-IP rejection; got: {msg}"
     );
 }
