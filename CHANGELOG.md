@@ -10,6 +10,8 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-20
+
 ### Added
 - CDP-driven (CRL Distribution Points) automatic CRL revocation checking for mTLS.
   Enabled by default whenever `[mtls]` is configured. CRL URLs are auto-discovered
