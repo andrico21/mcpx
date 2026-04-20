@@ -102,17 +102,17 @@ rmcp-server-kit = { version = "1", features = ["oauth", "metrics"] }
                           |
                           | depends on
                           v
-                    +-----------+
+                    +-----------------+
                     | rmcp-server-kit |   (lib crate)
-                    |           |
-                    | transport |   Streamable HTTP + TLS/mTLS
-                    | auth      |   Bearer, mTLS, OAuth JWT
-                    | rbac      |   Role-based access control
-                    | config    |   Server/observability config
-                    | error     |   McpxError -> HTTP status codes
-                    | metrics   |   Prometheus (optional)
-                    | oauth     |   JWT/JWKS validation (optional)
-                    +-----------+
+                    |                 |
+                    | transport       |   Streamable HTTP + TLS/mTLS
+                    | auth            |   Bearer, mTLS, OAuth JWT
+                    | rbac            |   Role-based access control
+                    | config          |   Server/observability config
+                    | error           |   McpxError -> HTTP status codes
+                    | metrics         |   Prometheus (optional)
+                    | oauth           |   JWT/JWKS validation (optional)
+                    +-----------------+
                           |
                           | uses
                           v
