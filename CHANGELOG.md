@@ -10,6 +10,45 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
+### Documentation
+
+- **Post-1.2.1 documentation follow-up.** Expanded `SECURITY.md`,
+  `docs/GUIDE.md`, `docs/MIGRATION.md`, `docs/ARCHITECTURE.md`,
+  `docs/MINDMAP.md`, and `README.md` to cover the 1.2.1 security
+  hardening surface end-to-end:
+  - New `SECURITY.md` subsections "CRL fetch SSRF hardening (since
+    1.2.1)", "OAuth HTTPS enforcement (since 1.2.1)", and "Trust
+    boundary on OAuth endpoint URLs", plus a refreshed
+    Supported-versions table (1.2.x active, 1.1.x maintenance).
+  - `docs/GUIDE.md` CRL/mTLS configuration block now documents the
+    three new TOML knobs (`crl_max_concurrent_fetches`,
+    `crl_max_response_bytes`, `crl_discovery_rate_per_min`) with
+    defaults (4 / 5 MiB / 60 per minute) and tuning guidance.
+  - New `docs/MIGRATION.md` "Migrating from 1.2.0 to 1.2.1" section
+    covering the `OauthHttpClient::with_config` migration and the
+    new CRL knobs.
+  - `docs/ARCHITECTURE.md` §7 gains "SSRF hardening (since 1.2.1)"
+    and "Discovery admission ordering (since 1.2.1)" subsections;
+    §8 documents the OAuth hardening defaults and the operator
+    trust boundary on `jwks_uri` / `issuer` / `authorization_endpoint`.
+  - `docs/MINDMAP.md` mTLS+OAuth subtree gains the SSRF-guard and
+    `OauthHttpClient::with_config` nodes.
+  - `README.md` OAuth example annotates the
+    `OauthHttpClient::with_config` migration with cross-links to
+    `MIGRATION.md` and `SECURITY.md`.
+  - Minor rustdoc clarification on
+    [`OauthHttpClient::with_config`] in `src/oauth.rs` explaining
+    the `ca_cert_path` propagation scope.
+- A known follow-up tracked for `1.3.0`: tighten OAuth HTTP fetch
+  paths (JWKS / token / introspection / revocation / exchange) with
+  the same per-hop SSRF guard already used for CRL fetches, reject
+  userinfo in `check_oauth_url`, and normalise IP literals
+  (octal/hex/percent-encoded) in `mtls_revocation`. The current
+  1.2.1 surface is safe under the documented operator-trusted
+  configuration model; see
+  `SECURITY.md#trust-boundary-on-oauth-endpoint-urls` for the
+  threat-model boundary.
+
 ## [1.2.1] - 2026-04-20
 
 This is a security patch release that rolls up three coordinated fixes

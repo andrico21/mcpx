@@ -96,6 +96,13 @@ let mut auth = AuthConfig::with_keys(vec![]);
 auth.oauth = Some(oauth);
 ```
 
+> Since `1.2.1`, if you construct `OauthHttpClient` directly, prefer
+> `OauthHttpClient::with_config(&oauth_config)` over the deprecated
+> `OauthHttpClient::new()` — the new constructor wires the configured
+> CA bundle and the HTTPS-downgrade-rejecting redirect policy in one
+> call. See [`docs/MIGRATION.md`](docs/MIGRATION.md#migrating-from-120-to-121)
+> and [`SECURITY.md`](SECURITY.md#oauth-https-enforcement-since-121).
+
 **Prometheus metrics on a separate listener:**
 
 ```rust,ignore

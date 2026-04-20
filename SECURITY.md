@@ -4,12 +4,12 @@
 
 | Version  | Supported |
 |----------|-----------|
-| 0.11.x   | ✅        |
-| 0.10.x   | ✅        |
-| < 0.10   | ❌        |
+| 1.2.x    | ✅        |
+| 1.1.x    | ✅        |
+| < 1.1    | ❌        |
 
-Once `rmcp-server-kit` reaches 1.0, we will support the latest minor release and the
-previous one for security fixes.
+We support the latest minor release and the previous one for security
+fixes. Patch releases (`x.y.Z`) are issued for the supported lines only.
 
 ## Reporting a vulnerability
 
@@ -96,12 +96,87 @@ crl_stale_grace          = "24h"    # how long an expired CRL can still be trust
   still apply.
 - **Caches are per-process and in-memory.** Restarting the process drops
   the cache; bootstrap re-fetches everything within the 10 s deadline.
-- **CDP URLs are honoured as-is.** rmcp-server-kit does not rewrite,
-  proxy, or pin them. Operators must ensure their issuing CA's CDP host
-  is reachable from the server's network.
+- **CDP URLs are honoured after SSRF normalisation, not rewritten.**
+  rmcp-server-kit does not proxy or pin CDP URLs, but it does enforce a
+  scheme allowlist, reject userinfo, and refuse private/loopback/link-local/
+  cloud-metadata IP literals before issuing the fetch (see
+  [CRL fetch SSRF hardening](#crl-fetch-ssrf-hardening-since-121) below).
+  Operators must still ensure their issuing CA's CDP host is reachable
+  from the server's network.
 - **Default is fail-open.** This protects availability over confidentiality;
   set `crl_deny_on_unavailable = true` if your threat model inverts that
   trade-off.
+
+### CRL fetch SSRF hardening (since 1.2.1)
+
+CRL Distribution Point URLs are extracted from X.509 extensions on
+attacker-influenceable client certificates, so the CRL fetcher is treated
+as a hostile-input network call. Before any HTTP request is issued,
+`src/mtls_revocation.rs::ssrf_guard` rejects URLs that:
+
+- Use a scheme other than `http://` or `https://` (`ftp://`, `file://`,
+  `gopher://`, `data:`, `dict://`, etc. are all denied).
+- Carry RFC 3986 userinfo (`user:pass@host`).
+- Resolve (after DNS) to a private/loopback/link-local/multicast/
+  unspecified/broadcast IPv4 or IPv6 address, including the cloud
+  metadata endpoints `169.254.169.254` and `fd00:ec2::254`, IPv4-mapped
+  IPv6 `::ffff:0:0/96`, IPv4-compatible IPv6, IPv6 unique-local
+  `fc00::/7`, IPv6 link-local `fe80::/10`, and the IPv6 loopback `::1`.
+
+In addition the fetcher applies four bounded-resource caps to limit
+SSRF/DoS amplification even if a CRL host is reachable:
+
+| Knob                            | Default       | Purpose                                                                                       |
+|---------------------------------|---------------|-----------------------------------------------------------------------------------------------|
+| `crl_max_concurrent_fetches`    | `4`           | Global cap on parallel CRL fetches across all hosts (per-host concurrency is hard-capped at 1). |
+| `crl_max_response_bytes`        | `5 MiB`       | Body size cap; streams aborted mid-response when exceeded.                                    |
+| `crl_discovery_rate_per_min`    | `60`          | Process-global rate limit on *new* CDP URLs admitted into the fetch pipeline.                  |
+| `crl_fetch_timeout`             | `30 s`        | Per-fetch HTTP timeout.                                                                        |
+
+The fetcher also disables HTTP redirects entirely for CRL traffic — a
+CRL is signed by the issuing CA, so blindly following a redirect to an
+operator-unintended host has no security benefit.
+
+URLs that lose the discovery rate-limiter race are **not** marked as
+seen, so a subsequent handshake observing the same URL can retry
+admission once the limiter window opens.
+
+### OAuth HTTPS enforcement (since 1.2.1)
+
+When the optional `oauth` feature is enabled, `OauthHttpClient`
+(`src/oauth.rs`) installs a redirect policy that:
+
+- Rejects HTTPS → HTTP downgrades unconditionally.
+- Allows HTTP → HTTP only when the operator has set
+  `oauth.allow_http_oauth_urls = true` (off by default; intended for
+  local development against a non-TLS IdP).
+- Caps redirect hops to a small constant.
+
+Prefer `OauthHttpClient::with_config(&OAuthConfig)` over the deprecated
+`OauthHttpClient::new()` so that this policy and the configured CA bundle
+are wired consistently for every OAuth-bound HTTPS call (JWKS, discovery,
+token exchange, the optional `/authorize`/`/token`/`/register`/
+`/introspect`/`/revoke` proxy upstreams).
+
+#### Trust boundary on OAuth endpoint URLs
+
+The `oauth.issuer_url`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
+URLs are treated as **operator-trusted configuration**, not as
+attacker-supplied input. As of 1.2.x the OAuth fetcher enforces scheme
+and redirect policy but **does not** apply the per-hop DNS/private-IP
+SSRF guard that the CRL fetcher applies, because that guard is intended
+for URLs extracted from peer X.509 extensions.
+
+Implications:
+
+- Do **not** allow tenants or end-users to influence
+  `oauth.issuer_url` / `oauth.jwks_uri` / discovery URLs at runtime.
+- A compromised IdP can make the server perform blind HTTPS GETs to any
+  internal host reachable from the deployment. Combine with strict
+  egress firewalling for high-assurance environments.
+- Per-hop SSRF guarding for OAuth fetches is tracked for **1.3.0**
+  (issue: extract `ssrf_guard` from `src/mtls_revocation.rs` and apply
+  it per redirect hop in `src/oauth.rs::JwksCache`).
 
 ### Defence-in-depth (still recommended)
 

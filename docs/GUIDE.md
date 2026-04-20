@@ -441,7 +441,24 @@ crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the pas
 crl_fetch_timeout        = "30s"    # per-fetch HTTP timeout
 crl_stale_grace          = "24h"    # how long an expired CRL can still be trusted while we keep retrying
 # crl_refresh_interval   = "1h"     # override the auto interval derived from nextUpdate
+
+# SSRF / DoS hardening knobs (since 1.2.1; defaults shown):
+crl_max_concurrent_fetches = 4         # global parallel CRL fetches across all hosts
+                                       # (per-host concurrency is hard-capped at 1)
+crl_max_response_bytes     = 5242880   # 5 MiB hard cap; streams aborted mid-response when exceeded
+crl_discovery_rate_per_min = 60        # process-global rate limit on *new* CDP URLs admitted
+                                       # to the fetch pipeline; URLs that lose the race are
+                                       # NOT marked as seen and may retry on the next handshake
 ```
+
+> **Tuning guidance.** The defaults are calibrated for a typical
+> single-tenant deployment. Raise `crl_discovery_rate_per_min` when you
+> expect bursts of *distinct* client identities pointing at many
+> distinct CDP URLs (e.g. multi-PKI federations); leave it conservative
+> when CDPs are few and stable. Lower `crl_max_response_bytes` if your
+> CA publishes only small CRLs; raise it cautiously for very large
+> revocation lists. `crl_max_concurrent_fetches` is the global SSRF
+> blast-radius bound — keep it low.
 
 ##### Defence-in-depth (still recommended even with CRL enabled)
 

@@ -112,10 +112,26 @@ mindmap
           nextUpdate refresh clamped 10min..24h
           Hot-swap verifier via ArcSwap
           Fail-open default; fail-closed opt-in
+          SSRF guard since 1.2.1
+            scheme allowlist http/https only
+            userinfo rejected
+            private/loopback/link-local/metadata IPs blocked
+            redirect=none for CRL traffic
+            crl_max_concurrent_fetches default 4
+            crl_max_response_bytes default 5 MiB
+            crl_discovery_rate_per_min default 60
+            commit-after-admission ordering
       OAuth 2.1 JWT
         JWKS verify
         Cache + cooldown
         Feature gated
+        OauthHttpClient since 1.2.1
+          with_config preferred
+          new deprecated
+          HTTPS to HTTP redirect rejected
+          HTTP to HTTP gated by allow_http_oauth_urls
+          Trust boundary issuer/jwks operator-only
+          Per-hop SSRF guard deferred to 1.3.0
     Middleware order
       outer to inner
       1 Origin check

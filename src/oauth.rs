@@ -456,7 +456,10 @@ impl OAuthConfigBuilder {
         self
     }
 
-    /// Provide a PEM CA bundle path used only when fetching the JWKS.
+    /// Provide a PEM CA bundle path used for all OAuth-bound HTTPS traffic
+    /// originated by this crate (JWKS fetches and the optional OAuth proxy
+    /// `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`,
+    /// `/.well-known/oauth-authorization-server` upstream calls).
     pub fn ca_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.inner.ca_cert_path = Some(path.into());
         self

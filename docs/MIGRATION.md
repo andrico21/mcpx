@@ -79,6 +79,71 @@ Both remain opt-in to keep the default dependency footprint small.
 
 ---
 
+## Migrating from 1.2.0 to 1.2.1
+
+`1.2.1` is a **security-hardening patch release**. There are no breaking
+public-API changes; every existing `1.2.0` consumer keeps compiling and
+linking. The notable behavioural changes are:
+
+### Hardened CRL fetcher (mTLS deployments only)
+
+The CRL Distribution Point fetcher now applies an SSRF guard before each
+fetch (scheme allowlist, userinfo reject, private/loopback/link-local/
+cloud-metadata IP block) and disables HTTP redirects for CRL traffic.
+Three new TOML knobs were added with safe defaults (see
+[`docs/GUIDE.md`](GUIDE.md#crl-configuration-toml-all-defaults-shown)
+and [`SECURITY.md`](../SECURITY.md#crl-fetch-ssrf-hardening-since-121)):
+
+```toml
+[mtls]
+crl_max_concurrent_fetches = 4         # default
+crl_max_response_bytes     = 5242880   # 5 MiB default
+crl_discovery_rate_per_min = 60        # default
+```
+
+If you previously relied on a CDP URL that resolved to a private IP
+(uncommon — typically a misconfiguration), the fetch will now fail with
+a structured deny log. Move the CRL host to a public address or behind
+a reverse proxy that the server can reach without leaving its trust zone.
+
+### `OauthHttpClient::new()` deprecated
+
+`OauthHttpClient::new()` is now `#[deprecated(since = "1.2.1")]` in
+favour of `OauthHttpClient::with_config(&OAuthConfig)`. The new
+constructor wires the configured CA bundle, the HTTPS-downgrade-rejecting
+redirect policy, and the `allow_http_oauth_urls` toggle in one call.
+The old constructor still works for one more minor release.
+
+```diff
+- let http = OauthHttpClient::new()?;
++ let http = OauthHttpClient::with_config(&oauth_config)?;
+```
+
+If you build an `OAuthConfig` via the builder, no source change is
+required — `JwksCache` and the OAuth proxy paths now construct
+`OauthHttpClient` via `with_config` internally. The deprecation only
+affects code that constructed `OauthHttpClient` directly.
+
+### Trust-boundary clarification for OAuth endpoint URLs
+
+`oauth.issuer_url` / `oauth.jwks_uri` / discovery URLs are treated as
+**operator-trusted configuration** in 1.2.x. Per-hop DNS/private-IP
+SSRF guarding for OAuth-bound traffic is deferred to **1.3.0**; in the
+meantime, do not let tenants or end-users influence those URLs at
+runtime. See
+[`SECURITY.md` — Trust boundary on OAuth endpoint URLs](../SECURITY.md#trust-boundary-on-oauth-endpoint-urls).
+
+### Action items
+
+1. `cargo update -p rmcp-server-kit` (or bump the pin to `"1.2.1"`).
+2. If you construct `OauthHttpClient` directly, switch to
+   `with_config(&oauth_config)`.
+3. If you run mTLS, scan your operator dashboard for CDP fetch denies
+   after upgrade and reclassify any URLs that resolved to private IPs.
+4. No action required if you do not use mTLS or OAuth.
+
+---
+
 ## Migrating from 0.x to 1.0
 
 `1.0.0` is the first stable release of `rmcp-server-kit`. From this point on the crate

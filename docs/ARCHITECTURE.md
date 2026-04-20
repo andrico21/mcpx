@@ -424,6 +424,50 @@ Failure modes:
 - `crl_allow_http = false` rejects `http://` CDP URLs.
 - `crl_end_entity_only = true` checks only the leaf, skipping intermediates.
 
+### SSRF hardening (since 1.2.1)
+
+`ssrf_guard` (`src/mtls_revocation.rs:73-200`) runs against every CDP URL
+*before* the HTTP request is issued, rejecting non-`http(s)` schemes,
+URLs with userinfo, and any host that resolves to a private/loopback/
+link-local/multicast/unspecified/broadcast/cloud-metadata address (IPv4
+and IPv6, including IPv4-mapped IPv6 and IPv4-compatible IPv6). The
+fetcher also pins `redirect::Policy::none()` for CRL traffic — a CRL is
+signed by the issuing CA, so following operator-unintended redirects has
+no security benefit. Three knobs cap the blast radius even when a CDP is
+reachable:
+
+- `crl_max_concurrent_fetches` (default 4) — global parallel-fetch cap;
+  per-host concurrency is independently hard-capped at 1 via
+  `host_semaphores`.
+- `crl_max_response_bytes` (default 5 MiB) — streams aborted mid-response
+  when exceeded (defends against gzip-bomb amplification).
+- `crl_discovery_rate_per_min` (default 60) — `governor`-based
+  process-global rate limit on **new** CDP URLs admitted to the fetch
+  pipeline.
+
+### Discovery admission ordering (since 1.2.1)
+
+`note_discovered_urls` (`src/mtls_revocation.rs:521-575`) implements a
+strict commit-after-admission protocol to keep the discovery rate
+limiter from "leaking" URLs:
+
+1. Snapshot the candidate URL set.
+2. Apply `ssrf_guard` to filter unreachable / hostile URLs.
+3. For each survivor, attempt `discovery_rate_limiter.check()`.
+4. **Only after** the limiter admits the URL **and** the
+   `discover_tx.send(url)` succeeds, insert the URL into the
+   `seen_urls` `HashSet`. If admission fails (limiter-throttled or
+   channel closed), the URL is intentionally **left unseen** so a
+   subsequent handshake observing the same URL can retry admission
+   once the limiter window opens.
+
+This ordering matters: a naive "mark seen, then attempt admission"
+implementation would silently drop CDP URLs forever the first time the
+rate limiter engaged, breaking revocation for the affected client
+identities. The current ordering is verified by
+`__test_check_discovery_rate` (`src/mtls_revocation.rs:666`) and by the
+`__test_with_kept_receiver` helper used in unit tests.
+
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a
 sentinel through the discover channel that forces re-fetch of every cached
 URL on the next refresher tick.
@@ -471,6 +515,21 @@ These let downstream MCP clients discover OAuth via the same origin as
 - Symmetric keys (`HS*`) are rejected by default — protects against
   algorithm-confusion attacks.
 - JWKS responses cached with TTL; stale-while-revalidate semantics.
+- HTTPS-downgrade-rejecting redirect policy on `OauthHttpClient` (since
+  1.2.1): HTTPS → HTTP redirects are denied unconditionally; HTTP → HTTP
+  is allowed only when `oauth.allow_http_oauth_urls = true`.
+- Prefer `OauthHttpClient::with_config(&OAuthConfig)` (since 1.2.1) over
+  the deprecated `OauthHttpClient::new()` so the redirect policy and CA
+  bundle are wired consistently.
+
+### Trust boundary (1.2.x)
+
+OAuth endpoint URLs (`issuer_url`, `jwks_uri`, discovery URLs) are
+**operator-trusted configuration**. Per-hop DNS/private-IP SSRF guarding
+is **not** applied to OAuth-bound fetches in 1.2.x — that hardening is
+queued for 1.3.0 (extract `ssrf_guard` from `src/mtls_revocation.rs` and
+apply it per redirect hop in `JwksCache`). Until then, never let tenants
+or end-users influence OAuth endpoint URLs at runtime.
 
 ---
 
