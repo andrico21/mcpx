@@ -339,7 +339,7 @@ async fn redirect_to_non_http_scheme_is_rejected() {
 async fn redirect_chain_capped_at_two_hops() {
     install_crypto_provider();
     let mock = MockServer::start().await;
-    let base = mock.uri();
+    let base = mock.uri().replace("127.0.0.1", "localhost");
 
     // /a -> /b -> /c -> /d (3 hops). The policy permits up to 2.
     let to_b = format!("{base}/b");
@@ -540,6 +540,36 @@ async fn rejects_redirect_with_userinfo_oauth_client() {
     let url = format!("{}/redir", mock.uri());
     let result = client.__test_get(&url).await;
     let err = result.expect_err("redirect with userinfo must be rejected");
+    let rendered = render_error_chain(&err);
+    assert!(
+        rendered.contains("redirect target forbidden")
+            || rendered.contains("userinfo")
+            || rendered.contains("credentials"),
+        "expected userinfo redirect rejection, got: {rendered}"
+    );
+    assert!(err.is_redirect(), "expected redirect-error, got {err:?}");
+}
+
+#[tokio::test]
+async fn redirect_to_http_with_userinfo_rejected_when_http_allowed() {
+    install_crypto_provider();
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redir"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "http://user:pass@example.com/pwn"),
+        )
+        .mount(&mock)
+        .await;
+
+    let mut config = OAuthConfig::default();
+    config.allow_http_oauth_urls = true;
+    let client = OauthHttpClient::with_config(&config).expect("client builds");
+
+    let url = format!("{}/redir", mock.uri());
+    let result = client.__test_get(&url).await;
+    let err = result.expect_err("http redirect with userinfo must be rejected");
     let rendered = render_error_chain(&err);
     assert!(
         rendered.contains("redirect target forbidden")

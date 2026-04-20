@@ -123,15 +123,15 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     None
 }
 
-/// Sync pre-DNS literal-IP check. If `url.host()` is an `Ipv4Addr` /
-/// `Ipv6Addr`, delegates to [`ip_block_reason`]. Returns `None` for
-/// DNS hostnames (deferred to post-DNS checks at fetch time) and for
-/// `None` hosts. Called at config-validation time and inside redirect
-/// policies.
+/// Sync pre-DNS literal-IP check. Any literal IPv4 or IPv6 host is
+/// rejected at URL-validation time, regardless of whether the address
+/// falls in a private or public range. OAuth operators must use DNS
+/// hostnames; post-DNS runtime checks remain the responsibility of the
+/// fetch path.
 pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
     match url.host()? {
-        url::Host::Ipv4(ip) => ip_block_reason(IpAddr::V4(ip)),
-        url::Host::Ipv6(ip) => ip_block_reason(IpAddr::V6(ip)),
+        url::Host::Ipv4(_) => Some("literal IPv4 addresses are forbidden; use a DNS hostname"),
+        url::Host::Ipv6(_) => Some("literal IPv6 addresses are forbidden; use a DNS hostname"),
         url::Host::Domain(_) => None,
     }
 }
@@ -146,7 +146,11 @@ pub(crate) fn redirect_target_reason(url: &Url) -> Option<&'static str> {
     if !url.username().is_empty() || url.password().is_some() {
         return Some("userinfo (credentials in URL) forbidden");
     }
-    check_url_literal_ip(url)
+    match url.host()? {
+        url::Host::Ipv4(ip) => ip_block_reason(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => ip_block_reason(IpAddr::V6(ip)),
+        url::Host::Domain(_) => None,
+    }
 }
 
 #[cfg(test)]
