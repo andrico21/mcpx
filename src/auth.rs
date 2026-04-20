@@ -318,6 +318,24 @@ pub struct MtlsConfig {
     /// Default: `60`.
     #[serde(default = "default_crl_discovery_rate_per_min")]
     pub crl_discovery_rate_per_min: u32,
+    /// Maximum number of distinct hosts that may hold a CRL fetch
+    /// semaphore at any time. Requests that would grow the map beyond
+    /// this cap return [`McpxError::Config`] containing the literal
+    /// substring `"crl_host_semaphore_cap_exceeded"`. Bounds memory
+    /// growth from attacker-controlled CDP URLs pointing at unique
+    /// hostnames. Default: 1024.
+    #[serde(default = "default_crl_max_host_semaphores")]
+    pub crl_max_host_semaphores: usize,
+    /// Maximum number of distinct URLs tracked in the "seen" set.
+    /// Beyond this, additional discovered URLs are silently dropped
+    /// with a rate-limited warn! log; no error surfaces. Default: 4096.
+    #[serde(default = "default_crl_max_seen_urls")]
+    pub crl_max_seen_urls: usize,
+    /// Maximum number of cached CRL entries. Beyond this, new
+    /// successful fetches are silently dropped with a rate-limited
+    /// warn! log (newest-rejected, not LRU-evicted). Default: 1024.
+    #[serde(default = "default_crl_max_cache_entries")]
+    pub crl_max_cache_entries: usize,
 }
 
 fn default_mtls_role() -> String {
@@ -346,6 +364,18 @@ const fn default_crl_max_response_bytes() -> u64 {
 
 const fn default_crl_discovery_rate_per_min() -> u32 {
     60
+}
+
+const fn default_crl_max_host_semaphores() -> usize {
+    1024
+}
+
+const fn default_crl_max_seen_urls() -> usize {
+    4096
+}
+
+const fn default_crl_max_cache_entries() -> usize {
+    1024
 }
 
 /// Rate limiting configuration for authentication attempts.

@@ -105,6 +105,7 @@ urlencoding = { version = "2", optional = true }
 default = []
 oauth = ["dep:jsonwebtoken", "dep:urlencoding"]
 metrics = ["dep:prometheus"]
+test-helpers = []
 
 [dev-dependencies]
 rcgen = "0.14"
@@ -161,12 +162,15 @@ unused_qualifications = "warn"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
-expect_used = "warn"
+expect_used = "allow"
 panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 unreachable = "warn"
 indexing_slicing = "deny"
+doc_markdown = "allow"
+duration_suboptimal_units = "allow"
+str_to_string = "allow"
 fallible_impl_from = "deny"
 wildcard_enum_match_arm = "deny"
 fn_params_excessive_bools = "deny"
@@ -182,7 +186,6 @@ large_enum_variant = "warn"
 box_collection = "warn"
 rc_buffer = "warn"
 clone_on_ref_ptr = "deny"
-str_to_string = "warn"
 exhaustive_enums = "warn"
 exhaustive_structs = "warn"
 cognitive_complexity = "warn"
