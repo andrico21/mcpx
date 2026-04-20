@@ -809,7 +809,8 @@ where
                 .oauth
                 .as_ref()
                 .map(|c| crate::oauth::JwksCache::new(c).map(Arc::new))
-                .transpose()?;
+                .transpose()
+                .map_err(|e| std::io::Error::other(format!("JWKS HTTP client: {e}")))?;
 
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),

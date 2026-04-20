@@ -1,10 +1,9 @@
 # Migrating to the standalone `rmcp-server-kit` crate
 
-This guide covers three migrations:
+This guide covers two migrations:
 
 1. Moving from an in-repo `path` dependency to the standalone crate.
 2. Upgrading from any `0.x` release to `1.0`.
-3. Upgrading from `1.x` to `2.0`.
 
 ## 1. Update your `Cargo.toml`
 
@@ -162,96 +161,3 @@ These are explicitly **not** breaking under our SemVer policy. If you
 match exhaustively on a non-exhaustive type or rely on a struct's exact
 field set, expect to add a wildcard arm or use one of the constructor
 helpers documented in the GUIDE.
-
----
-
-## Migrating from 1.x to 2.0
-
-`2.0.0` contains a single breaking change to a low-traffic API surface
-(`oauth::JwksCache::new`). Most consumers — including everyone who only
-uses `serve()` / `serve_with_listener()` and lets the framework
-construct the JWKS cache internally — need **no source changes** and can
-upgrade by bumping their `Cargo.toml` dependency.
-
-### Action items
-
-1. **Bump the dependency** to caret-`2`:
-
-    ```diff
-    -rmcp-server-kit = { version = "1", features = ["oauth"] }
-    +rmcp-server-kit = { version = "2", features = ["oauth"] }
-    ```
-
-2. **If — and only if — you call `oauth::JwksCache::new` directly** (rare;
-   the framework builds it internally for you), update the error type:
-
-    ```diff
-    -fn build_cache() -> Result<JwksCache, Box<dyn std::error::Error + Send + Sync>> {
-    -    JwksCache::new(&config)
-    -}
-    +fn build_cache() -> rmcp_server_kit::Result<JwksCache> {
-    +    JwksCache::new(&config)
-    +}
-    ```
-
-   Any caller already returning `rmcp_server_kit::Result<_>` /
-   `Result<_, McpxError>` and propagating with `?` keeps compiling
-   unchanged because [`McpxError`] now appears directly in the
-   `JwksCache::new` signature (no boxing).
-
-3. **Re-run your build & tests:**
-
-    ```bash
-    cargo update -p rmcp-server-kit
-    cargo build --all-features
-    cargo test --all-features
-    ```
-
-### Detailed change: `oauth::JwksCache::new` return type
-
-```diff
--pub fn new(config: &OAuthConfig)
--    -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
-+pub fn new(config: &OAuthConfig)
-+    -> Result<Self, McpxError>
-```
-
-**Why**: returning a boxed `dyn Error` is a public-API smell — it forces
-downstream callers to `Box<dyn ...>`-juggle, hides which failure modes
-are possible (CA-bundle I/O failure, malformed PEM, HTTP-client build
-failure), and prevents `?` propagation into the canonical
-[`McpxError`]-returning entrypoints (`serve()`, custom middleware, etc.).
-The narrowed return type maps each underlying failure to a concrete
-[`McpxError`] variant:
-
-| Underlying failure                                    | Mapped variant         |
-|-------------------------------------------------------|------------------------|
-| CA bundle file unreadable (`std::io::Error`)          | [`McpxError::Io`]       |
-| CA bundle is not valid PEM (`reqwest::Error`)         | [`McpxError::Config`]   |
-| HTTP client build failure (`reqwest::Error`)          | [`McpxError::Config`]   |
-
-The `rustls`/`jsonwebtoken` `default_provider().install_default()`
-calls continue to ignore their `Result` (idempotent in-process
-initialization; first installation wins, subsequent calls are
-no-ops). Behaviour is unchanged on success and unchanged on every
-failure mode the constructor previously raised — only the *type* of
-the returned error narrowed.
-
-[`McpxError`]: https://docs.rs/rmcp-server-kit/latest/rmcp_server_kit/error/enum.McpxError.html
-[`McpxError::Io`]: https://docs.rs/rmcp-server-kit/latest/rmcp_server_kit/error/enum.McpxError.html#variant.Io
-[`McpxError::Config`]: https://docs.rs/rmcp-server-kit/latest/rmcp_server_kit/error/enum.McpxError.html#variant.Config
-
-### What does *not* change
-
-- All other public APIs (`serve()`, `serve_with_listener()`,
-  `serve_stdio()`, `validate_token`, `OAuthConfig::builder`, the entire
-  `auth`, `rbac`, `tool_hooks`, `metrics`, `admin`, and `transport`
-  surfaces) are unchanged.
-- All `#[non_exhaustive]` markers are unchanged.
-- `McpxError` itself is unchanged (no new variants in 2.0; the existing
-  `Io` and `Config` variants carry the new mappings).
-- Cargo features (`oauth`, `metrics`) are unchanged.
-- The MCP wire protocol is unchanged.
-- MSRV is unchanged (Rust **1.95**).
-- Behaviour at runtime is unchanged on every code path: this is purely a
-  type-level refactor of one constructor's error channel.

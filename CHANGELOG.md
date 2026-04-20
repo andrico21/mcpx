@@ -10,45 +10,6 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
-## [2.0.0] - 2026-04-20
-
-This major release contains a single breaking change: the return type of
-`oauth::JwksCache::new` is narrowed from
-`Result<Self, Box<dyn std::error::Error + Send + Sync>>` to
-`Result<Self, McpxError>`. See [`docs/MIGRATION.md`](docs/MIGRATION.md#migrating-from-1x-to-20)
-for the upgrade procedure. Most consumers — everyone who only uses
-`serve()` / `serve_with_listener()` and lets the framework build the
-JWKS cache internally — need **no source changes** and can upgrade by
-bumping `Cargo.toml` to caret-`2`. Runtime behaviour is unchanged on
-every code path.
-
-### Breaking
-
-- **`src/oauth.rs::JwksCache::new`:** Return type narrowed from
-  `Result<Self, Box<dyn std::error::Error + Send + Sync>>` to
-  `Result<Self, McpxError>`. The boxed `dyn Error` exposed three
-  underlying failure modes (CA-bundle I/O, malformed PEM, HTTP-client
-  build) that are now mapped to concrete `McpxError` variants:
-  - CA bundle file unreadable (`std::io::Error`) → `McpxError::Io`
-    (via existing `#[from]` impl).
-  - CA bundle is not valid PEM (`reqwest::Error`) → `McpxError::Config`
-    with the message `"OAuth CA bundle is not valid PEM: …"`.
-  - HTTP client build failure (`reqwest::Error`) → `McpxError::Config`
-    with the message `"OAuth HTTP client build failed: …"`.
-
-  The `rustls`/`jsonwebtoken` `default_provider().install_default()`
-  calls continue to ignore their `Result` (idempotent in-process
-  initialization). Behaviour is unchanged on success and on every
-  failure mode the constructor previously raised — only the *type* of
-  the returned error narrowed.
-
-  Internal call site `src/transport.rs` (auth-state construction in
-  `serve()`) was simplified to propagate `McpxError` directly via `?`,
-  removing the previous `std::io::Error::other(format!(...))` wrap.
-
-  No new `McpxError` variants were introduced; the enum's
-  `#[non_exhaustive]` marker is preserved.
-
 ## [1.1.0] - 2026-04-20
 
 This minor release rolls up the Phase 1 documentation/CI hardening (originally
