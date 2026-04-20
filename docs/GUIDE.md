@@ -404,28 +404,62 @@ DNS SAN as the identity name. Used internally by the TLS acceptor.
 
 #### Certificate lifecycle and revocation (operator runbook)
 
-> **rmcp-server-kit does NOT validate CRL or OCSP for client certificates.** mTLS
-> trust in rmcp-server-kit is *point-in-time*: a cert is accepted whenever it
-> chains to a configured CA and is within its `notBefore`/`notAfter`
-> window. Revocation must be enforced *out of band*. See
+> ✅ **Since 1.2.0, rmcp-server-kit performs CDP-driven CRL revocation
+> checking for client certificates by default whenever `[mtls]` is
+> configured.** OCSP is **not** implemented. See
 > [SECURITY.md](../SECURITY.md#certificate-revocation) for the full
 > threat model.
 
-For production mTLS deployments, operators MUST adopt at least one of
-the following revocation strategies:
+CRL URLs are auto-discovered from the X.509 **CRL Distribution Points**
+(CDP) extension on the configured CA chain (eagerly at startup, with a
+10-second total bootstrap deadline) and from each new client certificate
+observed during a TLS handshake (lazily). CRLs are cached in memory keyed
+by URL and refreshed on a background task before `nextUpdate`, clamped to
+`[10 min, 24 h]`. The underlying `rustls::ClientCertVerifier` is hot-swapped
+via `ArcSwap` whenever fresh CRLs land, so handshakes always see the
+latest revocation data without dropping in-flight connections.
+
+**Default behaviour is fail-open**: if a CRL cannot be fetched or has
+expired beyond `crl_stale_grace`, the handshake is still allowed and a
+`WARN` log is emitted. Operators who require fail-closed semantics can set
+`crl_deny_on_unavailable = true`.
+
+`ReloadHandle::refresh_crls()` forces an immediate refresh of every
+cached CRL — useful from an admin endpoint or a cron-driven probe.
+
+##### CRL configuration (TOML, all defaults shown)
+
+```toml
+[mtls]
+ca_cert_path = "/etc/certs/clients-ca.pem"
+
+crl_enabled              = true     # set false to disable revocation entirely
+crl_deny_on_unavailable  = false    # fail-open by default; set true for fail-closed
+crl_allow_http           = true     # allow http:// CDP URLs (CRLs are signed by the CA)
+crl_end_entity_only      = false    # check the full chain, not just the leaf
+crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past (subject to grace)
+crl_fetch_timeout        = "30s"    # per-fetch HTTP timeout
+crl_stale_grace          = "24h"    # how long an expired CRL can still be trusted while we keep retrying
+# crl_refresh_interval   = "1h"     # override the auto interval derived from nextUpdate
+```
+
+##### Defence-in-depth (still recommended even with CRL enabled)
+
+CRL checking does not eliminate the value of the strategies below — combine
+them for the strongest posture:
 
 1. **Short-lived certificates (recommended).** Issue client certs with a
    maximum lifetime of **24 hours or less** so that compromised
    credentials expire on their own. Supported issuers:
 
-   - **[cert-manager](https://cert-manager.io/)** -- Kubernetes-native
+   - **[cert-manager](https://cert-manager.io/)** — Kubernetes-native
      issuer; configure `Certificate.spec.duration: 24h` and
      `renewBefore: 8h`. Pair with the CSI driver to deliver short-lived
      certs to workload pods without restart.
    - **[HashiCorp Vault PKI](https://developer.hashicorp.com/vault/docs/secrets/pki)**
-     -- set `max_ttl` on the role to `24h` and have clients re-issue
+     — set `max_ttl` on the role to `24h` and have clients re-issue
      via `vault write pki/issue/<role>` on a cron / sidecar.
-   - **[Smallstep `step-ca`](https://smallstep.com/docs/step-ca/)** --
+   - **[Smallstep `step-ca`](https://smallstep.com/docs/step-ca/)** —
      configure provisioner `claims.maxTLSCertDuration: 24h`; use
      `step ca renew --daemon` for hands-off rotation.
 
@@ -438,10 +472,11 @@ the following revocation strategies:
    the load balancer, service mesh (Istio/Linkerd `AuthorizationPolicy`),
    or WAF. This is the only mechanism with sub-second propagation.
 
-If your environment cannot meet any of the above, prefer the Bearer or
-OAuth 2.1 JWT auth methods, which support immediate revocation via the
-RFC 7009 revocation endpoint (`oauth.revocation_endpoint`) or by
-deleting the API key entry and calling `ReloadHandle::reload_auth_keys`.
+If your PKI publishes revocation only via OCSP (no CDP), CRL checking
+will not protect you. Prefer the Bearer or OAuth 2.1 JWT auth methods,
+which support immediate revocation via the RFC 7009 revocation endpoint
+(`oauth.revocation_endpoint`) or by deleting the API key entry and
+calling `ReloadHandle::reload_auth_keys`.
 
 #### `build_rate_limiter()`
 

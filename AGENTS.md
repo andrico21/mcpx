@@ -47,6 +47,7 @@ Z:\TempPersistent\mcpx\
 │   ├── auth.rs                 Authentication: API keys (Argon2), mTLS, AuthIdentity, AuthState
 │   ├── rbac.rs                 RBAC engine: RbacPolicy, task-local context, per-tool argument allowlists
 │   ├── oauth.rs                OAuth 2.1 JWT + JWKS cache (feature = "oauth")
+│   ├── mtls_revocation.rs      CDP-driven CRL fetcher + cache + dynamic ClientCertVerifier (1.2.0+)
 │   ├── admin.rs                Admin diagnostics router (/admin/*)
 │   ├── tool_hooks.rs           Optional HookedHandler wrapper (before/after hooks, result-size cap)
 │   ├── observability.rs        Tracing/JSON logging + audit-file sink
@@ -267,6 +268,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | Server entry / router / middleware order       | `src/transport.rs` — `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` — `AuthState`, `ApiKeyEntry`, `auth_middleware` |
 | mTLS identity extraction                       | `src/transport.rs` — `TlsListener::record_mtls_identity` (~line 921) |
+| mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` — `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` — `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` — `RbacPolicy::check`, `enforce_tool_policy` |
 | Per-tool argument allowlist                    | `src/rbac.rs` — `ArgumentAllowlist`, `argument_allowed` |

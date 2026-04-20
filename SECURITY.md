@@ -45,58 +45,101 @@ within **30 days** for confirmed high-severity issues.
 
 ## Certificate revocation
 
-> ⚠️ **rmcp-server-kit does NOT validate CRL or OCSP for client certificates.**
-> mTLS authentication is verified **point-in-time at the TLS handshake**
-> against the configured trust roots. There is **no online revocation
-> check**, no CRL fetcher, and no OCSP stapling validator.
+> ✅ **Since 1.2.0, rmcp-server-kit performs CDP-driven CRL revocation
+> checking for client certificates by default whenever `[mtls]` is
+> configured.** OCSP is **not** implemented.
 
-This is a deliberate trade-off: CRL/OCSP machinery adds significant
-operational complexity (network dependencies, soft-fail vs hard-fail
-semantics, clock skew, stapling negotiation) that is rarely tuned
-correctly and is itself a frequent source of outages and
-vulnerabilities. Operators are expected to manage revocation **out of
-band** using one of the following workflows.
+### How CRL checking works
 
-### Required mitigations (pick at least one)
+When mTLS is enabled, rmcp-server-kit:
 
-1. **Short-lived certificates (≤24h)** — strongly recommended.
-   - The cert lifetime IS the revocation window.
-   - Issue with [cert-manager](https://cert-manager.io/) using
-     `Certificate.spec.duration: 24h` (or shorter) and
-     `renewBefore: 8h`.
-   - Issue with [HashiCorp Vault PKI](https://developer.hashicorp.com/vault/docs/secrets/pki)
-     dynamic secrets (`max_ttl=24h`, agent-driven renewal).
-   - Issue with [Smallstep `step-ca`](https://smallstep.com/docs/step-ca/)
-     and the autorenewal daemon.
-2. **CA rotation on compromise** — for longer-lived certs, you MUST
-   rotate the issuing CA and reload rmcp-server-kit (use the `ReloadHandle` from
-   `transport::serve()` to swap trust roots without restart).
-3. **Network-layer revocation** — block compromised peers at your
-   service mesh / load balancer / firewall.
+1. At startup, scans the configured CA chain for the X.509 **CRL Distribution
+   Points** (CDP) extension and fetches each referenced CRL via HTTP(S),
+   bounded by a 10-second total bootstrap deadline.
+2. On each new client certificate observed during a TLS handshake, lazily
+   discovers any additional CDP URLs the leaf or intermediates point at and
+   schedules them for fetch.
+3. Caches every CRL in memory keyed by URL and refreshes it before
+   `nextUpdate` (clamped to `[10 min, 24 h]`) on a background task.
+4. Hot-swaps the underlying `rustls::ClientCertVerifier` via `ArcSwap` once
+   new CRLs land, so handshakes always check the freshest revocation data
+   without dropping in-flight connections.
+5. **Fails open by default**: if a CRL cannot be fetched or has expired
+   beyond the configured grace period, the handshake is still allowed and
+   a `WARN` log is emitted. Operators who require fail-closed semantics can
+   set `crl_deny_on_unavailable = true`.
 
-### What "point-in-time mTLS" means
+`ReloadHandle::refresh_crls()` forces an immediate refresh of every cached
+CRL — useful from an admin endpoint or a cron-driven probe.
 
-When a client presents a certificate, rmcp-server-kit (via `rustls`) verifies:
+### Configuration (TOML)
 
-- The chain validates against the configured CA roots.
-- The leaf certificate's `notBefore` / `notAfter` window covers
-  *now*.
-- Signatures are cryptographically valid.
+```toml
+[mtls]
+ca_cert_path = "/etc/certs/clients-ca.pem"
 
-After the handshake completes, the connection is trusted for its
-lifetime regardless of any subsequent revocation event. **A long-lived
-mTLS session with a revoked certificate will continue to be honoured
-until the connection is closed by either side.**
+# CRL fields (all defaults shown)
+crl_enabled              = true     # set false to disable revocation entirely
+crl_deny_on_unavailable  = false    # fail-open by default; set true for fail-closed
+crl_allow_http           = true     # allow http:// CDP URLs (CRLs are signed by the CA, so plain HTTP is acceptable)
+crl_end_entity_only      = false    # check the full chain, not just the leaf
+crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past (subject to crl_stale_grace)
+crl_fetch_timeout        = "30s"    # per-fetch HTTP timeout
+crl_stale_grace          = "24h"    # how long an expired CRL can still be trusted while we keep retrying
+# crl_refresh_interval   = "1h"     # override the auto interval derived from nextUpdate
+```
+
+### Limitations
+
+- **OCSP is not implemented.** If your PKI distributes revocation only via
+  OCSP (no CDP), CRL checking will not protect you. Mitigations below
+  still apply.
+- **Caches are per-process and in-memory.** Restarting the process drops
+  the cache; bootstrap re-fetches everything within the 10 s deadline.
+- **CDP URLs are honoured as-is.** rmcp-server-kit does not rewrite,
+  proxy, or pin them. Operators must ensure their issuing CA's CDP host
+  is reachable from the server's network.
+- **Default is fail-open.** This protects availability over confidentiality;
+  set `crl_deny_on_unavailable = true` if your threat model inverts that
+  trade-off.
+
+### Defence-in-depth (still recommended)
+
+Even with CRL enabled, the original mitigations remain best practice:
+
+1. **Short-lived certificates (≤24h)** — bounds exposure regardless of CRL
+   propagation latency.
+   - [cert-manager](https://cert-manager.io/) `Certificate.spec.duration: 24h`, `renewBefore: 8h`.
+   - [HashiCorp Vault PKI](https://developer.hashicorp.com/vault/docs/secrets/pki) `max_ttl=24h` with agent-driven renewal.
+   - [Smallstep `step-ca`](https://smallstep.com/docs/step-ca/) with the autorenewal daemon.
+2. **CA rotation on compromise** — for longer-lived certs you can still
+   rotate the issuing CA and reload via `ReloadHandle::reload_*` for a
+   zero-downtime swap of trust roots.
+3. **Network-layer revocation** — block compromised peers at the service
+   mesh / load balancer / firewall for sub-second propagation.
+
+### What "point-in-time mTLS" still means
+
+CRL checking happens at handshake time. After a connection is established,
+the session remains trusted for its lifetime regardless of any subsequent
+revocation event. **A long-lived mTLS session with a certificate that is
+revoked *after* the handshake will continue to be honoured until the
+connection is closed by either side.** Combine short-lived sessions with
+short-lived certs for the strongest guarantees.
 
 ### Threat model addendum
 
-- A stolen private key is valid for the full remaining lifetime of the
-  associated certificate. ≤24h cert lifetimes bound this exposure.
-- An evicted operator's certificate remains valid until expiry. Use
-  short-lived certs and/or rotate the issuing CA.
-- rmcp-server-kit does **not** participate in any revocation protocol. Adding CRL
-  or OCSP validation is **deferred** and tracked as a future
-  enhancement (no committed timeline).
+- A stolen private key is valid until either (a) the next CRL publication
+  marks it revoked **and** rmcp-server-kit's cache refreshes, or (b) the
+  certificate's `notAfter` passes — whichever comes first. ≤24 h cert
+  lifetimes still bound this exposure even when CRL fetching fails.
+- An evicted operator's certificate becomes invalid as soon as the
+  issuing CA publishes the updated CRL and rmcp-server-kit refreshes it
+  (≤ `nextUpdate` clamped to 24 h, or immediately via
+  `ReloadHandle::refresh_crls()`).
+- OCSP is not implemented; if your PKI publishes only OCSP, treat
+  revocation as unsupported and apply the defence-in-depth mitigations
+  above.
 
 ## Coordinated disclosure
 

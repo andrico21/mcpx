@@ -384,6 +384,55 @@ Configuration toggles:
 - Cipher suites: `rustls` defaults (ring crypto provider).
 - mTLS: optional; when enabled, missing/invalid client cert → connection refused.
 
+### CRL revocation (CDP-driven, since 1.2.0)
+
+**File**: `src/mtls_revocation.rs` (~600 LOC). Active automatically whenever
+`[mtls]` is configured and `crl_enabled = true` (the default).
+
+Lifecycle:
+1. `bootstrap_fetch(roots, config)` is called from `run_server` *before*
+   the listener is built. It walks the configured CA chain, extracts every
+   X.509 CRL Distribution Point (CDP) URL via `extract_cdp_urls`, fetches
+   each via `reqwest` under a 10 s total deadline, and seeds the cache.
+2. The returned `Arc<CrlSet>` owns:
+   - `inner_verifier: ArcSwap<VerifierHandle>` — current
+     `Arc<dyn ClientCertVerifier>` built from the latest CRL set; swapped
+     atomically when CRLs refresh.
+   - `cache: tokio::sync::RwLock<HashMap<String, CachedCrl>>` keyed by URL.
+   - `discover_tx: mpsc::UnboundedSender<String>` — channel used by the
+     handshake path to register newly observed CDP URLs for fetch.
+   - `seen_urls: Mutex<HashSet<String>>` — dedupe of URLs already processed.
+3. `DynamicClientCertVerifier` is the `Arc<dyn ClientCertVerifier>` handed
+   to `rustls::ServerConfig`. Its 8 trait methods delegate to the inner
+   verifier loaded from `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor`
+   clones the verifier `Arc` from the `ServerConfig` at construction, the
+   dynamic verifier MUST be the Arc handed to rustls; its inner verifier
+   then swaps via the internal `ArcSwap`.
+4. `run_crl_refresher(set, rx, shutdown)` is spawned by `run_server`. It:
+   - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
+   - Re-fetches each cached CRL before its `nextUpdate`, clamped to
+     `[10 min, 24 h]` (overridable via `crl_refresh_interval`).
+   - On any successful fetch, rebuilds the inner verifier and `inner_verifier.store()`s it.
+   - Honours `crl_fetch_timeout` per request and `crl_stale_grace` for cache
+     eviction of long-expired CRLs.
+
+Failure modes:
+- Fetch failure / parse failure / expired-beyond-grace: cache entry is
+  marked stale; if `crl_deny_on_unavailable = false` (default) handshakes
+  continue with a `WARN` log; if `true`, handshakes that depend on the
+  affected CRL are rejected.
+- `crl_allow_http = false` rejects `http://` CDP URLs.
+- `crl_end_entity_only = true` checks only the leaf, skipping intermediates.
+
+Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a
+sentinel through the discover channel that forces re-fetch of every cached
+URL on the next refresher tick.
+
+Test helper: `__test_with_prepopulated_crls(...)` (doc-hidden) lets `tests/e2e.rs`
+seed a `CrlSet` with synthetic `rcgen`-generated CRLs and `wiremock`-served
+CDP endpoints. Four e2e tests cover: unrevoked-allows, revoked-rejects,
+fail-open on unreachable CDP, fail-closed on unreachable CDP.
+
 **Plain HTTP fallback**: when no TLS cert is supplied, axum binds a
 plain `TcpListener` (`src/transport.rs:1013-1057`). For production
 deployments, TLS is strongly recommended.

@@ -106,6 +106,12 @@ mindmap
         TlsListener captures cert
         Keyed by SocketAddr
         x509-parser CN/SAN
+        CDP-driven CRL revocation
+          Auto-discover from CA chain + client certs
+          reqwest fetcher + in-memory cache
+          nextUpdate refresh clamped 10min..24h
+          Hot-swap verifier via ArcSwap
+          Fail-open default; fail-closed opt-in
       OAuth 2.1 JWT
         JWKS verify
         Cache + cooldown
