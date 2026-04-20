@@ -128,8 +128,17 @@ jobs:
       - name: Verify SECURITY.md documents mTLS revocation [H-S4]
         run: |
           set -e
-          grep -q "does NOT validate \(CRL\|OCSP\)" SECURITY.md
+          # Section header is still required.
           grep -q "Certificate revocation" SECURITY.md
+          # Since 1.2.0 we DO implement CDP-driven CRL checking. Assert that
+          # SECURITY.md describes the current behaviour rather than the old
+          # "does NOT validate CRL/OCSP" disclaimer.
+          grep -qE "CDP[- ]driven CRL" SECURITY.md
+          grep -q "crl_deny_on_unavailable" SECURITY.md
+          # OCSP is still explicitly not implemented; make sure that limitation
+          # remains documented so operators don't assume it works.
+          grep -qE "OCSP is (\*\*)?not(\*\*)? implemented" SECURITY.md
+          # Defence-in-depth guidance must remain.
           grep -qE "(short-lived|24h|24 hour)" SECURITY.md
           grep -qE "(cert-manager|Vault PKI|Smallstep)" docs/GUIDE.md
 
