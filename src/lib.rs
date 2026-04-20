@@ -54,6 +54,9 @@ pub mod oauth;
 /// Prometheus metrics registry shared across server components.
 pub mod metrics;
 
+/// CDP-driven CRL revocation support for mTLS.
+pub mod mtls_revocation;
+
 // Re-export the canonical error types at the crate root for ergonomic
 // `rmcp_server_kit::Result<()>` / `rmcp_server_kit::McpxError` usage in downstream crates.
 pub use crate::error::{McpxError, Result};

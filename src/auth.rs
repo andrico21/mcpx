@@ -242,6 +242,10 @@ impl ApiKeyEntry {
 
 /// mTLS client certificate authentication configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mTLS CRL behavior is intentionally configured as independent booleans"
+)]
 #[non_exhaustive]
 pub struct MtlsConfig {
     /// Path to CA certificate(s) for verifying client certs (PEM format).
@@ -254,10 +258,50 @@ pub struct MtlsConfig {
     /// The client cert CN becomes the identity name.
     #[serde(default = "default_mtls_role")]
     pub default_role: String,
+    /// Enable CRL-based certificate revocation checks using CDP URLs from the
+    /// configured CA chain and connecting client certificates.
+    #[serde(default = "default_true")]
+    pub crl_enabled: bool,
+    /// Optional fixed refresh interval for known CRLs. When omitted, refresh
+    /// cadence is derived from `nextUpdate` and clamped internally.
+    #[serde(default, with = "humantime_serde::option")]
+    pub crl_refresh_interval: Option<Duration>,
+    /// Timeout for individual CRL fetches.
+    #[serde(default = "default_crl_fetch_timeout", with = "humantime_serde")]
+    pub crl_fetch_timeout: Duration,
+    /// Grace window during which stale CRLs may still be used when refresh
+    /// attempts fail.
+    #[serde(default = "default_crl_stale_grace", with = "humantime_serde")]
+    pub crl_stale_grace: Duration,
+    /// When true, missing or unavailable CRLs cause revocation checks to fail
+    /// closed.
+    #[serde(default)]
+    pub crl_deny_on_unavailable: bool,
+    /// When true, apply revocation checks only to the end-entity certificate.
+    #[serde(default)]
+    pub crl_end_entity_only: bool,
+    /// Allow HTTP CRL distribution-point URLs in addition to HTTPS.
+    #[serde(default = "default_true")]
+    pub crl_allow_http: bool,
+    /// Enforce CRL expiration during certificate validation.
+    #[serde(default = "default_true")]
+    pub crl_enforce_expiration: bool,
 }
 
 fn default_mtls_role() -> String {
     "viewer".into()
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_crl_fetch_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+const fn default_crl_stale_grace() -> Duration {
+    Duration::from_hours(24)
 }
 
 /// Rate limiting configuration for authentication attempts.

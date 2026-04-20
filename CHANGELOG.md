@@ -10,6 +10,20 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
+### Added
+- CDP-driven (CRL Distribution Points) automatic CRL revocation checking for mTLS.
+  Enabled by default whenever `[mtls]` is configured. CRL URLs are auto-discovered
+  from the CA chain at startup (10s bootstrap timeout) and from connecting client
+  certs lazily. Cached in memory keyed by URL with `nextUpdate`-aware refresh
+  (clamped to [10min, 24h]). Fail-open with WARN logs by default; flip
+  `crl_deny_on_unavailable = true` for fail-closed. `ReloadHandle::refresh_crls()`
+  forces immediate refresh of all cached URLs.
+
+### Changed
+- `reqwest` is now a required (non-optional) dependency. The `oauth` feature
+  no longer pulls it in via `dep:reqwest`. No user-facing API change; cargo
+  resolution is identical for crates that already enabled the `oauth` feature.
+
 ## [1.1.1] - 2026-04-20
 
 ### Security

@@ -498,6 +498,361 @@ async fn auth_rate_limit_triggers() {
     assert_eq!(resp.status(), 429, "request 3 should be rate limited");
 }
 
+mod crl_tests {
+    use std::{net::IpAddr, path::PathBuf};
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer,
+        CrlDistributionPoint, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyIdMethod, KeyPair,
+        KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber, date_time_ymd,
+    };
+    use rmcp_server_kit::{
+        auth::{AuthConfig, MtlsConfig},
+        mtls_revocation::{CrlSet, DynamicClientCertVerifier},
+    };
+    use rustls::{
+        RootCertStore,
+        pki_types::{CertificateRevocationListDer, UnixTime},
+        server::danger::ClientCertVerifier as _,
+    };
+    use wiremock::MockServer;
+
+    use super::*;
+
+    struct TestPki {
+        ca_pem: String,
+        server_cert_pem: String,
+        server_key_pem: String,
+        client_cert_pem: String,
+        client_key_pem: String,
+        client_der: rustls::pki_types::CertificateDer<'static>,
+        ca_der: rustls::pki_types::CertificateDer<'static>,
+        crl_der: CertificateRevocationListDer<'static>,
+    }
+
+    struct TlsMaterialPaths {
+        _dir: PathBuf,
+        ca_cert: PathBuf,
+        server_cert: PathBuf,
+        server_key: PathBuf,
+    }
+
+    fn build_certified_ca() -> CertifiedIssuer<'static, KeyPair> {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "test-ca");
+
+        let ca_key = KeyPair::generate().expect("ca key");
+        CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca self-signed")
+    }
+
+    fn build_end_entity_params(
+        common_name: &str,
+        serial: u64,
+        cdp_url: &str,
+        usages: Vec<ExtendedKeyUsagePurpose>,
+    ) -> CertificateParams {
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params.serial_number = Some(SerialNumber::from(serial));
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(IpAddr::from([127, 0, 0, 1])));
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = usages;
+        params.use_authority_key_identifier_extension = true;
+        params.crl_distribution_points = vec![CrlDistributionPoint {
+            uris: vec![cdp_url.to_owned()],
+        }];
+        params
+    }
+
+    fn build_crl(
+        issuer: &Issuer<'_, KeyPair>,
+        revoked_serials: &[u64],
+    ) -> CertificateRevocationListDer<'static> {
+        let revoked_certs = revoked_serials
+            .iter()
+            .map(|serial| RevokedCertParams {
+                serial_number: SerialNumber::from(*serial),
+                revocation_time: date_time_ymd(2026, 1, 2),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect::<Vec<_>>();
+
+        CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2027, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(issuer)
+        .expect("crl signed")
+        .into()
+    }
+
+    fn build_test_pki(cdp_url: &str, client_serial: u64, revoked_serials: &[u64]) -> TestPki {
+        let ca = build_certified_ca();
+
+        let server_key = KeyPair::generate().expect("server key");
+        let server_cert = build_end_entity_params(
+            "localhost",
+            11,
+            cdp_url,
+            vec![ExtendedKeyUsagePurpose::ServerAuth],
+        )
+        .signed_by(&server_key, &ca)
+        .expect("server cert");
+
+        let client_key = KeyPair::generate().expect("client key");
+        let client_cert = build_end_entity_params(
+            "mtls-client",
+            client_serial,
+            cdp_url,
+            vec![ExtendedKeyUsagePurpose::ClientAuth],
+        )
+        .signed_by(&client_key, &ca)
+        .expect("client cert");
+
+        TestPki {
+            ca_pem: ca.pem(),
+            server_cert_pem: server_cert.pem(),
+            server_key_pem: server_key.serialize_pem(),
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+            client_der: client_cert.der().clone(),
+            ca_der: ca.der().clone(),
+            crl_der: build_crl(&ca, revoked_serials),
+        }
+    }
+
+    async fn write_tls_materials(pki: &TestPki, suffix: &str) -> TlsMaterialPaths {
+        let dir = std::env::temp_dir().join(format!(
+            "rmcp-server-kit-crl-{suffix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+
+        let ca_cert = dir.join("ca.pem");
+        let server_cert = dir.join("server.pem");
+        let server_key = dir.join("server.key");
+
+        tokio::fs::write(&ca_cert, &pki.ca_pem)
+            .await
+            .expect("write ca pem");
+        tokio::fs::write(&server_cert, &pki.server_cert_pem)
+            .await
+            .expect("write server cert pem");
+        tokio::fs::write(&server_key, &pki.server_key_pem)
+            .await
+            .expect("write server key pem");
+
+        TlsMaterialPaths {
+            _dir: dir,
+            ca_cert,
+            server_cert,
+            server_key,
+        }
+    }
+
+    fn build_mtls_auth_config(ca_cert_path: &PathBuf, deny_on_unavailable: bool) -> AuthConfig {
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "api_keys": [],
+            "mtls": {
+                "ca_cert_path": ca_cert_path,
+                "required": true,
+                "default_role": "viewer",
+                "crl_enabled": true,
+                "crl_deny_on_unavailable": deny_on_unavailable,
+                "crl_allow_http": true,
+                "crl_enforce_expiration": true,
+                "crl_end_entity_only": false,
+                "crl_fetch_timeout": "1s",
+                "crl_stale_grace": "24h"
+            }
+        }))
+        .expect("mtls auth config")
+    }
+
+    fn build_verifier_mtls_config(ca_cert_path: &str) -> MtlsConfig {
+        serde_json::from_value(serde_json::json!({
+            "ca_cert_path": ca_cert_path,
+            "required": true,
+            "default_role": "viewer",
+            "crl_enabled": true,
+            "crl_deny_on_unavailable": false,
+            "crl_allow_http": true,
+            "crl_enforce_expiration": true,
+            "crl_end_entity_only": false,
+            "crl_fetch_timeout": "30s",
+            "crl_stale_grace": "24h"
+        }))
+        .expect("verifier mtls config")
+    }
+
+    fn build_verifier(pki: &TestPki) -> DynamicClientCertVerifier {
+        let mut roots = RootCertStore::empty();
+        roots.add(pki.ca_der.clone()).expect("root add");
+        let crl_set = CrlSet::__test_with_prepopulated_crls(
+            Arc::new(roots),
+            build_verifier_mtls_config("memory://ca.pem"),
+            vec![pki.crl_der.clone()],
+        )
+        .expect("crl set");
+        DynamicClientCertVerifier::new(crl_set)
+    }
+
+    async fn spawn_tls_server(config: McpServerConfig) -> ServerHarness {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound: SocketAddr = listener.local_addr().unwrap();
+        let config = config.with_bind_addr(bound.to_string());
+
+        let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+        let shutdown = CancellationToken::new();
+        let shutdown_for_server = shutdown.clone();
+
+        let join = tokio::spawn(async move {
+            rmcp_server_kit::transport::serve_with_listener(
+                listener,
+                config.validate().expect("tls test config valid"),
+                || TestHandler,
+                Some(ready_tx),
+                Some(shutdown_for_server),
+            )
+            .await
+        });
+
+        let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("tls server readiness")
+            .expect("tls server task aborted");
+
+        ServerHarness {
+            base: format!("https://localhost:{}", signalled.port()),
+            shutdown,
+            join: Some(join),
+        }
+    }
+
+    fn build_mtls_client(pki: &TestPki) -> reqwest::Client {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let ca_cert = reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).expect("ca cert");
+        let identity = reqwest::Identity::from_pem(
+            format!(
+                "{}{}{}",
+                pki.client_cert_pem, pki.ca_pem, pki.client_key_pem
+            )
+            .as_bytes(),
+        )
+        .expect("client identity");
+
+        reqwest::Client::builder()
+            .add_root_certificate(ca_cert)
+            .identity(identity)
+            .build()
+            .expect("mtls reqwest client")
+    }
+
+    #[tokio::test]
+    async fn crl_allows_unrevoked_client() {
+        let mock_server = MockServer::start().await;
+        let pki = build_test_pki(&format!("{}/ca.crl", mock_server.uri()), 100, &[]);
+        let verifier = build_verifier(&pki);
+
+        let result = verifier.verify_client_cert(&pki.client_der, &[], UnixTime::now());
+        assert!(result.is_ok(), "unrevoked client cert should verify");
+    }
+
+    #[tokio::test]
+    async fn crl_rejects_revoked_client() {
+        let mock_server = MockServer::start().await;
+        let pki = build_test_pki(&format!("{}/ca.crl", mock_server.uri()), 101, &[101]);
+        let verifier = build_verifier(&pki);
+
+        let result = verifier.verify_client_cert(&pki.client_der, &[], UnixTime::now());
+        assert!(
+            result.is_err(),
+            "revoked client cert should fail verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn crl_fail_open_when_cdp_unreachable() {
+        let pki = build_test_pki("http://127.0.0.1:1/unreachable.crl", 102, &[]);
+        let paths = write_tls_materials(&pki, "fail-open").await;
+        let auth = build_mtls_auth_config(&paths.ca_cert, false);
+
+        let port = free_port().await;
+        let cfg = config_on_port(port)
+            .with_tls(&paths.server_cert, &paths.server_key)
+            .with_auth(auth);
+        let mut harness = spawn_tls_server(cfg).await;
+
+        let client = build_mtls_client(&pki);
+        let response = client
+            .get(format!("{}/healthz", harness.base))
+            .send()
+            .await
+            .expect("fail-open request should succeed");
+
+        assert_eq!(response.status(), 200);
+        harness.shutdown().await.expect("shutdown fail-open server");
+    }
+
+    #[tokio::test]
+    async fn crl_fail_closed_when_cdp_unreachable() {
+        let pki = build_test_pki("http://127.0.0.1:1/unreachable.crl", 103, &[]);
+        let paths = write_tls_materials(&pki, "fail-closed").await;
+        let auth = build_mtls_auth_config(&paths.ca_cert, true);
+
+        let port = free_port().await;
+        let cfg = config_on_port(port)
+            .with_tls(&paths.server_cert, &paths.server_key)
+            .with_auth(auth);
+        let mut harness = spawn_tls_server(cfg).await;
+
+        let client = build_mtls_client(&pki);
+        let response = client.get(format!("{}/healthz", harness.base)).send().await;
+
+        assert!(
+            response.is_err(),
+            "fail-closed request should fail during handshake"
+        );
+        harness
+            .shutdown()
+            .await
+            .expect("shutdown fail-closed server");
+    }
+}
+
 // ==========================================================================
 // C1 regression: middleware ordering
 // ==========================================================================

@@ -15,6 +15,7 @@ use rmcp::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
+use rustls::RootCertStore;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +25,7 @@ use crate::{
         build_rate_limiter, extract_mtls_identity,
     },
     error::McpxError,
+    mtls_revocation::{self, CrlSet, DynamicClientCertVerifier},
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter, rbac_middleware},
 };
 
@@ -691,6 +693,7 @@ impl McpServerConfig {
 pub struct ReloadHandle {
     auth: Option<Arc<AuthState>>,
     rbac: Option<Arc<ArcSwap<RbacPolicy>>>,
+    crl_set: Option<Arc<CrlSet>>,
 }
 
 impl ReloadHandle {
@@ -707,6 +710,21 @@ impl ReloadHandle {
             rbac.store(Arc::new(policy));
             tracing::info!("RBAC policy reloaded");
         }
+    }
+
+    /// Force an immediate refresh of all cached mTLS CRLs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CRL refresh is unavailable or verifier rebuild fails.
+    pub async fn refresh_crls(&self) -> Result<(), McpxError> {
+        let Some(ref crl_set) = self.crl_set else {
+            return Err(McpxError::Config(
+                "CRL refresh requested but mTLS CRL support is not configured".into(),
+            ));
+        };
+
+        crl_set.force_refresh().await
     }
 }
 
@@ -737,6 +755,12 @@ struct AppRunParams {
     mtls_config: Option<MtlsConfig>,
     /// Graceful shutdown drain window.
     shutdown_timeout: Duration,
+    /// Shared auth state used by hot-reload callbacks.
+    auth_state: Option<Arc<AuthState>>,
+    /// Hot-reloadable RBAC state used by reload callbacks.
+    rbac_swap: Arc<ArcSwap<RbacPolicy>>,
+    /// Optional callback that receives the final [`ReloadHandle`].
+    on_reload_ready: Option<Box<dyn FnOnce(ReloadHandle) + Send>>,
     /// Server-internal cancellation token. Cancelled by [`run_server`]
     /// once the shutdown trigger fires (so rmcp's child token also
     /// fires, terminating in-flight MCP sessions).
@@ -931,25 +955,11 @@ where
             "auth enabled on /mcp"
         );
 
-        // Deliver reload handle to caller before capturing state in middleware.
-        if let Some(cb) = config.on_reload_ready.take() {
-            cb(ReloadHandle {
-                auth: Some(Arc::clone(state)),
-                rbac: Some(Arc::clone(&rbac_swap)),
-            });
-        }
-
         let state_for_mw = Arc::clone(state);
         mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
             let s = Arc::clone(&state_for_mw);
             auth_middleware(s, req, next)
         }));
-    } else if let Some(cb) = config.on_reload_ready.take() {
-        // Auth disabled but caller wants reload handle (RBAC-only reload).
-        cb(ReloadHandle {
-            auth: None,
-            rbac: Some(Arc::clone(&rbac_swap)),
-        });
     }
 
     // [3] Request timeout (returns 408 on expiry). Bounds total request
@@ -1217,6 +1227,9 @@ where
             tls_paths,
             mtls_config,
             shutdown_timeout: config.shutdown_timeout,
+            auth_state,
+            rbac_swap,
+            on_reload_ready: config.on_reload_ready.take(),
             ct,
             scheme,
             name: config.name.clone(),
@@ -1267,6 +1280,9 @@ where
         params.tls_paths,
         params.mtls_config,
         params.shutdown_timeout,
+        params.auth_state,
+        params.rbac_swap,
+        params.on_reload_ready,
         params.ct,
     )
     .await
@@ -1346,6 +1362,9 @@ where
         params.tls_paths,
         params.mtls_config,
         params.shutdown_timeout,
+        params.auth_state,
+        params.rbac_swap,
+        params.on_reload_ready,
         params.ct,
     )
     .await
@@ -1387,12 +1406,20 @@ fn log_listening(name: &str, scheme: &str, addr: &str) {
 /// hang indefinitely. The current implementation derives both branches
 /// from a single shared trigger so the timeout race is anchored to the
 /// FIRST (and only) signal.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cognitive_complexity,
+    reason = "server start-up threads TLS, reload state, and graceful shutdown through one flow"
+)]
 async fn run_server(
     router: axum::Router,
     listener: TcpListener,
     tls_paths: Option<(PathBuf, PathBuf)>,
     mtls_config: Option<MtlsConfig>,
     shutdown_timeout: Duration,
+    auth_state: Option<Arc<AuthState>>,
+    rbac_swap: Arc<ArcSwap<RbacPolicy>>,
+    mut on_reload_ready: Option<Box<dyn FnOnce(ReloadHandle) + Send>>,
     ct: CancellationToken,
 ) -> anyhow::Result<()> {
     // `shutdown_trigger` fires when the FIRST source resolves: either
@@ -1430,7 +1457,39 @@ async fn run_server(
     };
 
     if let Some((cert_path, key_path)) = tls_paths {
-        let tls_listener = TlsListener::new(listener, &cert_path, &key_path, mtls_config.as_ref())?;
+        let crl_set = if let Some(mtls) = mtls_config.as_ref()
+            && mtls.crl_enabled
+        {
+            let (ca_certs, roots) = load_client_auth_roots(&mtls.ca_cert_path)?;
+            let (crl_set, discover_rx) =
+                mtls_revocation::bootstrap_fetch(roots, &ca_certs, mtls.clone())
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            tokio::spawn(mtls_revocation::run_crl_refresher(
+                Arc::clone(&crl_set),
+                discover_rx,
+                ct.clone(),
+            ));
+            Some(crl_set)
+        } else {
+            None
+        };
+
+        if let Some(cb) = on_reload_ready.take() {
+            cb(ReloadHandle {
+                auth: auth_state.clone(),
+                rbac: Some(Arc::clone(&rbac_swap)),
+                crl_set: crl_set.clone(),
+            });
+        }
+
+        let tls_listener = TlsListener::new(
+            listener,
+            &cert_path,
+            &key_path,
+            mtls_config.as_ref(),
+            crl_set,
+        )?;
         let make_svc = router.into_make_service_with_connect_info::<TlsConnInfo>();
         tokio::select! {
             result = axum::serve(tls_listener, make_svc)
@@ -1440,6 +1499,14 @@ async fn run_server(
             }
         }
     } else {
+        if let Some(cb) = on_reload_ready.take() {
+            cb(ReloadHandle {
+                auth: auth_state,
+                rbac: Some(rbac_swap),
+                crl_set: None,
+            });
+        }
+
         let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
         tokio::select! {
             result = axum::serve(listener, make_svc)
@@ -1637,6 +1704,7 @@ impl TlsListener {
         cert_path: &Path,
         key_path: &Path,
         mtls_config: Option<&MtlsConfig>,
+        crl_set: Option<Arc<CrlSet>>,
     ) -> anyhow::Result<Self> {
         // Install the ring crypto provider (ok to call multiple times).
         rustls::crypto::ring::default_provider()
@@ -1650,27 +1718,32 @@ impl TlsListener {
 
         let tls_config = if let Some(mtls) = mtls_config {
             mtls_default_role = mtls.default_role.clone();
-            let ca_certs = load_certs(&mtls.ca_cert_path)?;
-            let mut root_store = rustls::RootCertStore::empty();
-            for cert in &ca_certs {
-                root_store
-                    .add(cert.clone())
-                    .map_err(|e| anyhow::anyhow!("invalid CA cert: {e}"))?;
-            }
-            let verifier = if mtls.required {
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+            let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = if mtls.crl_enabled
+            {
+                let Some(crl_set) = crl_set else {
+                    return Err(anyhow::anyhow!(
+                        "mTLS CRL verifier requested but CRL state was not initialized"
+                    ));
+                };
+                Arc::new(DynamicClientCertVerifier::new(crl_set))
             } else {
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-                    .allow_unauthenticated()
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+                let (_, root_store) = load_client_auth_roots(&mtls.ca_cert_path)?;
+                if mtls.required {
+                    rustls::server::WebPkiClientVerifier::builder(root_store)
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+                } else {
+                    rustls::server::WebPkiClientVerifier::builder(root_store)
+                        .allow_unauthenticated()
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+                }
             };
 
             tracing::info!(
                 ca = %mtls.ca_cert_path.display(),
                 required = mtls.required,
+                crl_enabled = mtls.crl_enabled,
                 "mTLS client auth configured"
             );
 
@@ -1844,6 +1917,23 @@ fn load_certs(path: &Path) -> anyhow::Result<Vec<rustls::pki_types::CertificateD
         path.display()
     );
     Ok(certs)
+}
+
+fn load_client_auth_roots(
+    path: &Path,
+) -> anyhow::Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    Arc<RootCertStore>,
+)> {
+    let ca_certs = load_certs(path)?;
+    let mut root_store = RootCertStore::empty();
+    for cert in &ca_certs {
+        root_store
+            .add(cert.clone())
+            .map_err(|error| anyhow::anyhow!("invalid CA cert: {error}"))?;
+    }
+
+    Ok((ca_certs, Arc::new(root_store)))
 }
 
 fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
