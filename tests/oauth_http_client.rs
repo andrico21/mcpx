@@ -528,8 +528,7 @@ async fn rejects_redirect_with_userinfo_oauth_client() {
     Mock::given(method("GET"))
         .and(path("/redir"))
         .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("location", "https://evil@example.com/pwn"),
+            ResponseTemplate::new(302).insert_header("location", "https://evil@example.com/pwn"),
         )
         .mount(&mock)
         .await;

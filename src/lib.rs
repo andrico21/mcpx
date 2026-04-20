@@ -43,6 +43,8 @@ pub mod admin;
 /// Re-exports for the [`secrecy`] crate's secret-wrapper types.
 pub mod secret;
 
+pub(crate) mod ssrf;
+
 /// Opt-in tool-call hooks (before/after) and result-size cap.
 pub mod tool_hooks;
 
