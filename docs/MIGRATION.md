@@ -107,9 +107,10 @@ guard fails the underlying `reqwest` call; on the OAuth path this surfaces
 as an HTTP 500 with `"failed to fetch ..."` and the rejection reason is
 emitted as a `WARN` log line.
 
-This release does **not** add an async DNS-resolution guard on the
-initial (non-redirect) OAuth request itself — the validate-time blanket
-literal-IP rejection is the trust anchor for operator-supplied URLs.
+This release does **not** perform async DNS-based private-IP rejection
+on direct (non-redirect) OAuth requests. The validate-time blanket
+literal-IP rejection is the primary trust anchor for operator-supplied
+URLs.
 
 ### OAuth hardening: URL validation and JWKS caps
 
@@ -150,6 +151,7 @@ upward.
    `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
    `introspection_endpoint` you set) do not use IP literals or contain
    userinfo (use DNS names instead).
+
 4. No action required if you do not use mTLS or OAuth.
 
 ---

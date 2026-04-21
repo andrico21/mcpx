@@ -450,9 +450,9 @@ For OAuth specifically, 1.3.0 covers:
   `https -> http` downgrade rejection and `http -> http` gating on
   `allow_http_oauth_urls`.
 
-1.3.0 does **not** add an async DNS-resolution guard on the initial
-(non-redirect) OAuth request itself — the validate-time blanket
-literal-IP rejection is the trust anchor for operator-supplied URLs.
+1.3.0 does **not** perform async DNS-based private-IP rejection on direct
+(non-redirect) OAuth requests. The validate-time blanket literal-IP
+rejection is the primary trust anchor for operator-supplied URLs.
 
 Additionally, several knobs cap the blast radius even when a host is
 reachable:

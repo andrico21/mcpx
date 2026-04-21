@@ -879,14 +879,9 @@ As of **1.3.0**, OAuth URL hardening operates in two layers:
   IP ranges. `https -> http` downgrades are always rejected; `http -> http`
   is permitted only when `allow_http_oauth_urls = true`.
 
-There is also a fail-closed cap on the JWKS key count:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document. |
-
 The redirect-hop limit (max 2) and per-request HTTP timeouts are enforced
 internally and are not configurable knobs in 1.3.0.
+
 
 ---
 
