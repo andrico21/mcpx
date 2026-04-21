@@ -8,6 +8,22 @@ Starting with `1.0.0`, breaking changes bump the **major** version. Pre-1.0
 releases (`0.x.y`) used the convention that breaking changes bumped the
 **minor** version.
 
+## [1.3.1] - 2026-04-21
+
+Patch release covering one library code-quality fix that landed on `main`
+after the `1.3.0` tag was cut. **No breaking changes**; no behavioural
+changes for downstream consumers under default Cargo settings.
+
+### Fixed
+
+- **`src/ssrf.rs`** — Gate the OAuth-only helpers `check_url_literal_ip` and
+  `redirect_target_reason` behind `#[cfg(feature = "oauth")]`. Without these
+  gates, building `rmcp-server-kit` with default features under
+  `RUSTFLAGS="-D warnings"` triggered dead-code warnings (then errors) on the
+  helpers, since their only callers live inside the `oauth` feature. Cargo
+  strips warnings from non-workspace dependencies, so this never broke real
+  consumers, but it broke strict-CI workspaces that vendored the crate.
+
 ## [1.3.0] - 2026-04-20
 
 This release focuses on multi-layered security hardening across OAuth and mTLS
