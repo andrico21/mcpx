@@ -76,12 +76,6 @@ jobs:
     name: cargo-semver-checks
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    # Non-blocking until 1.3.0 is published to crates.io and a baseline
-    # exists. cargo-semver-checks needs a published prior version to
-    # diff against; for the very first release this job cannot run.
-    # Revert to a hard failure (remove `continue-on-error`) in a
-    # follow-up PR once 1.3.0 is on crates.io.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
