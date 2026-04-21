@@ -861,7 +861,9 @@ role = "viewer"
 | `scopes` | `Vec<ScopeMapping>` | `[]` | OAuth scope -> RBAC role mapping. |
 | `jwks_cache_ttl` | `String` | `"10m"` | JWKS cache refresh interval. |
 | `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document (since 1.3.0). |
+| `jwks_max_response_bytes` | `u64` | `1048576` | Fail-closed cap on the JWKS HTTP response body size (1 MiB default). |
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
+| `strict_audience_validation` | `bool` | `false` | When `true`, validate only `aud` and disable the legacy `azp` fallback. Recommended for new deployments. |
 
 #### SSRF and DoS Hardening (OAuth)
 
@@ -878,6 +880,17 @@ As of **1.3.0**, OAuth URL hardening operates in two layers:
   link-local, multicast, broadcast, unspecified, or cloud-metadata
   IP ranges. `https -> http` downgrades are always rejected; `http -> http`
   is permitted only when `allow_http_oauth_urls = true`.
+- **Before every initial outbound connect**, OAuth/JWKS fetches resolve the
+  hostname with DNS and reject any target whose resolved IP falls in the same
+  blocked ranges. This closes the post-DNS SSRF gap for the first request hop.
+
+For new deployments, prefer:
+
+```toml
+[server.auth.oauth]
+strict_audience_validation = true
+jwks_max_response_bytes = 1048576
+```
 
 The redirect-hop limit (max 2) and per-request HTTP timeouts are enforced
 internally and are not configurable knobs in 1.3.0.
@@ -989,6 +1002,17 @@ will expose matching local proxies:
   introspection endpoint, injecting `client_id` (and
   `client_secret` for confidential clients) before forwarding.
 - `POST /revoke` -- same shape for token revocation.
+
+For backward compatibility these endpoints are mounted unauthenticated unless
+you opt in with:
+
+```toml
+[server.auth.oauth.proxy]
+expose_admin_endpoints = true
+require_auth_on_admin_endpoints = true
+```
+
+New deployments should set `require_auth_on_admin_endpoints = true`.
 
 The Authorization Server Metadata document
 (`/.well-known/oauth-authorization-server`) automatically advertises

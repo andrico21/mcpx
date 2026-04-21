@@ -21,7 +21,7 @@ use std::{
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::{net::lookup_host, sync::RwLock};
 
 use crate::auth::{AuthIdentity, AuthMethod};
 
@@ -74,6 +74,104 @@ fn evaluate_oauth_redirect(
     Ok(())
 }
 
+/// Screen an OAuth/JWKS target before the initial outbound connect.
+///
+/// This complements the per-redirect-hop guard in
+/// [`evaluate_oauth_redirect`]: redirects are screened synchronously via
+/// [`crate::ssrf::redirect_target_reason`], while the initial request target
+/// is screened here after DNS resolution so hostnames resolving to
+/// loopback/private/link-local/metadata space are rejected before any TCP
+/// dial occurs.
+#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+async fn screen_oauth_target_with_test_override(
+    url: &str,
+    allow_http: bool,
+    #[cfg(any(test, feature = "test-helpers"))] test_allow_loopback_ssrf: bool,
+) -> Result<(), crate::error::McpxError> {
+    let parsed = check_oauth_url("oauth target", url, allow_http)?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    if test_allow_loopback_ssrf {
+        return Ok(());
+    }
+    if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
+        return Err(crate::error::McpxError::Config(format!(
+            "OAuth target forbidden ({reason}): {url}"
+        )));
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        crate::error::McpxError::Config(format!("OAuth target URL has no host: {url}"))
+    })?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        crate::error::McpxError::Config(format!("OAuth target URL has no known port: {url}"))
+    })?;
+
+    let addrs = lookup_host((host, port)).await.map_err(|error| {
+        crate::error::McpxError::Config(format!("OAuth target DNS resolution {url}: {error}"))
+    })?;
+
+    let mut any_addr = false;
+    for addr in addrs {
+        any_addr = true;
+        if let Some(reason) = crate::ssrf::ip_block_reason(addr.ip()) {
+            return Err(crate::error::McpxError::Config(format!(
+                "OAuth target resolved to blocked IP ({reason}): {url}"
+            )));
+        }
+    }
+    if !any_addr {
+        return Err(crate::error::McpxError::Config(format!(
+            "OAuth target DNS resolution returned no addresses: {url}"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn screen_oauth_target(url: &str, allow_http: bool) -> Result<(), crate::error::McpxError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        screen_oauth_target_with_test_override(url, allow_http, false).await
+    }
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    {
+        let parsed = check_oauth_url("oauth target", url, allow_http)?;
+        if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
+            return Err(crate::error::McpxError::Config(format!(
+                "OAuth target forbidden ({reason}): {url}"
+            )));
+        }
+
+        let host = parsed.host_str().ok_or_else(|| {
+            crate::error::McpxError::Config(format!("OAuth target URL has no host: {url}"))
+        })?;
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            crate::error::McpxError::Config(format!("OAuth target URL has no known port: {url}"))
+        })?;
+
+        let addrs = lookup_host((host, port)).await.map_err(|error| {
+            crate::error::McpxError::Config(format!("OAuth target DNS resolution {url}: {error}"))
+        })?;
+
+        let mut any_addr = false;
+        for addr in addrs {
+            any_addr = true;
+            if let Some(reason) = crate::ssrf::ip_block_reason(addr.ip()) {
+                return Err(crate::error::McpxError::Config(format!(
+                    "OAuth target resolved to blocked IP ({reason}): {url}"
+                )));
+            }
+        }
+        if !any_addr {
+            return Err(crate::error::McpxError::Config(format!(
+                "OAuth target DNS resolution returned no addresses: {url}"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP client wrapper
 // ---------------------------------------------------------------------------
@@ -117,6 +215,9 @@ fn evaluate_oauth_redirect(
 #[derive(Clone)]
 pub struct OauthHttpClient {
     inner: reqwest::Client,
+    allow_http: bool,
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_allow_loopback_ssrf: bool,
 }
 
 impl OauthHttpClient {
@@ -227,7 +328,42 @@ impl OauthHttpClient {
         let inner = builder.build().map_err(|e| {
             crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
         })?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            allow_http,
+            #[cfg(any(test, feature = "test-helpers"))]
+            test_allow_loopback_ssrf: false,
+        })
+    }
+
+    async fn send_screened(
+        &self,
+        url: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, crate::error::McpxError> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if self.test_allow_loopback_ssrf {
+            screen_oauth_target_with_test_override(url, self.allow_http, true).await?;
+        } else {
+            screen_oauth_target(url, self.allow_http).await?;
+        }
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        screen_oauth_target(url, self.allow_http).await?;
+        request.send().await.map_err(|error| {
+            crate::error::McpxError::Config(format!("oauth request {url}: {error}"))
+        })
+    }
+
+    /// Test-only: disable initial-target SSRF screening for loopback-backed
+    /// fixtures. This is unreachable from normal production builds and exists
+    /// only so tests can exercise higher-level OAuth flows against local mock
+    /// servers.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_allow_loopback_ssrf(mut self) -> Self {
+        self.test_allow_loopback_ssrf = true;
+        self
     }
 
     /// Test-only: issue a `GET` against an arbitrary URL using the
@@ -322,6 +458,19 @@ pub struct OAuthConfig {
     /// (cache remains empty / unchanged). Default: 256.
     #[serde(default = "default_max_jwks_keys")]
     pub max_jwks_keys: usize,
+    /// Enforce strict audience validation using only the JWT `aud` claim.
+    ///
+    /// **Default: `false`.** When `false`, rmcp-server-kit preserves the
+    /// historical compatibility behavior of accepting either
+    /// `aud.contains(audience)` or `azp == audience`. New deployments should
+    /// prefer `true` so the resource-server check follows `aud` only.
+    #[serde(default)]
+    pub strict_audience_validation: bool,
+    /// Maximum size of a JWKS HTTP response body in bytes.
+    /// Responses exceeding this cap are refused and logged; the cache
+    /// remains empty / unchanged. Default: 1 MiB.
+    #[serde(default = "default_jwks_max_bytes")]
+    pub jwks_max_response_bytes: u64,
 }
 
 fn default_jwks_cache_ttl() -> String {
@@ -330,6 +479,10 @@ fn default_jwks_cache_ttl() -> String {
 
 const fn default_max_jwks_keys() -> usize {
     256
+}
+
+const fn default_jwks_max_bytes() -> u64 {
+    1024 * 1024
 }
 
 impl Default for OAuthConfig {
@@ -347,6 +500,8 @@ impl Default for OAuthConfig {
             ca_cert_path: None,
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
+            strict_audience_validation: false,
+            jwks_max_response_bytes: default_jwks_max_bytes(),
         }
     }
 }
@@ -568,6 +723,19 @@ impl OAuthConfigBuilder {
         self
     }
 
+    /// Toggle strict audience validation so only the JWT `aud` claim is
+    /// considered and the compatibility fallback to `azp` is disabled.
+    pub const fn strict_audience_validation(mut self, strict: bool) -> Self {
+        self.inner.strict_audience_validation = strict;
+        self
+    }
+
+    /// Override the maximum JWKS response body size in bytes.
+    pub const fn jwks_max_response_bytes(mut self, bytes: u64) -> Self {
+        self.inner.jwks_max_response_bytes = bytes;
+        self
+    }
+
     /// Finalise the builder and return the [`OAuthConfig`].
     #[must_use]
     pub fn build(self) -> OAuthConfig {
@@ -710,6 +878,13 @@ pub struct OAuthProxyConfig {
     /// this `false` (the default) makes the endpoints return 404.
     #[serde(default)]
     pub expose_admin_endpoints: bool,
+    /// Require the normal authentication middleware before the local
+    /// `/introspect` and `/revoke` proxy endpoints are reached.
+    ///
+    /// **Default: `false` for backward compatibility.** New deployments
+    /// should set this to `true` when exposing admin endpoints.
+    #[serde(default)]
+    pub require_auth_on_admin_endpoints: bool,
 }
 
 impl OAuthProxyConfig {
@@ -782,6 +957,13 @@ impl OAuthProxyConfigBuilder {
         self
     }
 
+    /// Require the normal authentication middleware on `/introspect` and
+    /// `/revoke`.
+    pub const fn require_auth_on_admin_endpoints(mut self, require: bool) -> Self {
+        self.inner.require_auth_on_admin_endpoints = require;
+        self
+    }
+
     /// Finalise the builder and return the [`OAuthProxyConfig`].
     #[must_use]
     pub fn build(self) -> OAuthProxyConfig {
@@ -833,12 +1015,16 @@ pub struct JwksCache {
     jwks_uri: String,
     ttl: Duration,
     max_jwks_keys: usize,
+    max_response_bytes: u64,
+    allow_http: bool,
     inner: RwLock<Option<CachedKeys>>,
     http: reqwest::Client,
     validation_template: Validation,
     /// Expected audience value from config - checked manually against
-    /// `aud` (array) OR `azp` (authorized-party) claim per RFC 9068 / OIDC Core.
+    /// `aud` (array) and, unless strict validation is enabled, optionally
+    /// `azp` (authorized-party) for backward compatibility.
     expected_audience: String,
+    strict_audience_validation: bool,
     scopes: Vec<ScopeMapping>,
     role_claim: Option<String>,
     role_mappings: Vec<RoleMapping>,
@@ -847,6 +1033,8 @@ pub struct JwksCache {
     last_refresh_attempt: RwLock<Option<Instant>>,
     /// Serializes concurrent refresh attempts so only one fetch is in flight.
     refresh_lock: tokio::sync::Mutex<()>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_allow_loopback_ssrf: bool,
 }
 
 /// Minimum cooldown between JWKS refresh attempts (prevents abuse).
@@ -958,16 +1146,32 @@ impl JwksCache {
             jwks_uri: config.jwks_uri.clone(),
             ttl,
             max_jwks_keys: config.max_jwks_keys,
+            max_response_bytes: config.jwks_max_response_bytes,
+            allow_http,
             inner: RwLock::new(None),
             http,
             validation_template: validation,
             expected_audience: config.audience.clone(),
+            strict_audience_validation: config.strict_audience_validation,
             scopes: config.scopes.clone(),
             role_claim: config.role_claim.clone(),
             role_mappings: config.role_mappings.clone(),
             last_refresh_attempt: RwLock::new(None),
             refresh_lock: tokio::sync::Mutex::new(()),
+            #[cfg(any(test, feature = "test-helpers"))]
+            test_allow_loopback_ssrf: false,
         })
+    }
+
+    /// Test-only: disable initial-target SSRF screening for loopback-backed
+    /// fixtures. This is unreachable from normal production builds and exists
+    /// only so tests can fetch JWKS from local mock servers.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_allow_loopback_ssrf(mut self) -> Self {
+        self.test_allow_loopback_ssrf = true;
+        self
     }
 
     /// Validate a JWT Bearer token. Returns `Some(AuthIdentity)` on success.
@@ -1099,19 +1303,20 @@ impl JwksCache {
         Ok((key, header.alg))
     }
 
-    /// Manual audience check: accept if `aud` contains the expected value
-    /// OR if `azp` (authorized party) matches it. This covers the common
-    /// Keycloak pattern where `azp` = requesting client and `aud` = target
-    /// resource servers. Per RFC 9068 Sec.4 the resource server checks
-    /// `aud` for its own identifier; per OIDC Core Sec.2 `azp` is the
-    /// client the token was issued to. When the MCP server is both client
-    /// and resource server, either claim matching is valid.
+    /// Manual audience check.
+    ///
+    /// By default (`strict_audience_validation = false`), rmcp-server-kit
+    /// preserves the compatibility behavior of accepting either
+    /// `aud.contains(expected_audience)` or `azp == expected_audience`.
+    /// When [`OAuthConfig::strict_audience_validation`] is `true`, only the
+    /// `aud` claim is considered and the `azp` fallback is ignored.
     fn check_audience(&self, claims: &Claims) -> Result<(), JwtValidationFailure> {
         let aud_ok = claims.aud.contains(&self.expected_audience)
-            || claims
-                .azp
-                .as_deref()
-                .is_some_and(|azp| azp == self.expected_audience);
+            || (!self.strict_audience_validation
+                && claims
+                    .azp
+                    .as_deref()
+                    .is_some_and(|azp| azp == self.expected_audience));
         if aud_ok {
             return Ok(());
         }
@@ -1120,7 +1325,8 @@ impl JwksCache {
             aud = ?claims.aud.0,
             azp = ?claims.azp,
             expected = %self.expected_audience,
-            "JWT rejected: audience mismatch (neither aud nor azp match)"
+            strict = self.strict_audience_validation,
+            "JWT rejected: audience mismatch"
         );
         Err(JwtValidationFailure::Invalid)
     }
@@ -1245,18 +1451,60 @@ impl JwksCache {
     }
 
     /// Fetch and parse the JWKS document. Returns `None` and logs on failure.
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "screening, bounded streaming, and parse logging are intentionally kept in one fetch path"
+    )]
     async fn fetch_jwks(&self) -> Option<JwkSet> {
-        let resp = match self.http.get(&self.jwks_uri).send().await {
+        #[cfg(any(test, feature = "test-helpers"))]
+        let screening = if self.test_allow_loopback_ssrf {
+            screen_oauth_target_with_test_override(&self.jwks_uri, self.allow_http, true).await
+        } else {
+            screen_oauth_target(&self.jwks_uri, self.allow_http).await
+        };
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let screening = screen_oauth_target(&self.jwks_uri, self.allow_http).await;
+
+        if let Err(error) = screening {
+            tracing::warn!(error = %error, uri = %self.jwks_uri, "failed to screen JWKS target");
+            return None;
+        }
+
+        let mut resp = match self.http.get(&self.jwks_uri).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(error = %e, uri = %self.jwks_uri, "failed to fetch JWKS");
                 return None;
             }
         };
-        match resp.json::<JwkSet>().await {
+
+        let initial_capacity =
+            usize::try_from(self.max_response_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
+        let mut body = Vec::with_capacity(initial_capacity);
+        while let Some(chunk) = match resp.chunk().await {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                tracing::warn!(error = %error, uri = %self.jwks_uri, "failed to read JWKS response");
+                return None;
+            }
+        } {
+            let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            if body_len.saturating_add(chunk_len) > self.max_response_bytes {
+                tracing::warn!(
+                    uri = %self.jwks_uri,
+                    max_bytes = self.max_response_bytes,
+                    "JWKS response exceeded configured size cap"
+                );
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        match serde_json::from_slice::<JwkSet>(&body) {
             Ok(jwks) => Some(jwks),
-            Err(e) => {
-                tracing::warn!(error = %e, uri = %self.jwks_uri, "failed to parse JWKS");
+            Err(error) => {
+                tracing::warn!(error = %error, uri = %self.jwks_uri, "failed to parse JWKS");
                 None
             }
         }
@@ -1540,6 +1788,16 @@ pub fn authorization_server_metadata(server_url: &str, config: &OAuthConfig) -> 
                 serde_json::Value::String(format!("{server_url}/revoke")),
             );
         }
+        if proxy.require_auth_on_admin_endpoints {
+            obj.insert(
+                "introspection_endpoint_auth_methods_supported".into(),
+                serde_json::json!(["bearer"]),
+            );
+            obj.insert(
+                "revocation_endpoint_auth_methods_supported".into(),
+                serde_json::json!(["bearer"]),
+            );
+        }
     }
     meta
 }
@@ -1601,11 +1859,13 @@ pub async fn handle_token(
     }
 
     let result = http
-        .inner
-        .post(&proxy.token_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(upstream_body)
-        .send()
+        .send_screened(
+            &proxy.token_url,
+            http.inner
+                .post(&proxy.token_url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(upstream_body),
+        )
         .await;
 
     match result {
@@ -1725,11 +1985,13 @@ async fn proxy_oauth_admin_request(
     }
 
     let result = http
-        .inner
-        .post(upstream_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(upstream_body)
-        .send()
+        .send_screened(
+            upstream_url,
+            http.inner
+                .post(upstream_url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(upstream_body),
+        )
         .await;
 
     match result {
@@ -1846,11 +2108,14 @@ pub async fn exchange_token(
 
     let form_body = build_exchange_form(config, subject_token);
 
-    let resp = req.body(form_body).send().await.map_err(|e| {
-        tracing::error!(error = %e, "token exchange request failed");
-        // Do NOT leak upstream URL, reqwest internals, or DNS detail to clients.
-        crate::error::McpxError::Auth("server_error".into())
-    })?;
+    let resp = http
+        .send_screened(&config.token_url, req.body(form_body))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "token exchange request failed");
+            // Do NOT leak upstream URL, reqwest internals, or DNS detail to clients.
+            crate::error::McpxError::Auth("server_error".into())
+        })?;
 
     let status = resp.status();
     let body_bytes = resp.bytes().await.map_err(|e| {
@@ -2028,6 +2293,8 @@ mod tests {
             ca_cert_path: None,
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
+            strict_audience_validation: false,
+            jwks_max_response_bytes: default_jwks_max_bytes(),
         };
         let meta = protected_resource_metadata(
             "https://mcp.example.com/mcp",
@@ -2379,7 +2646,13 @@ mod tests {
             ca_cert_path: None,
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
+            strict_audience_validation: false,
+            jwks_max_response_bytes: default_jwks_max_bytes(),
         }
+    }
+
+    fn test_cache(config: &OAuthConfig) -> JwksCache {
+        JwksCache::new(config).unwrap().__test_allow_loopback_ssrf()
     }
 
     #[tokio::test]
@@ -2396,7 +2669,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let token = mint_token(
             &pem,
@@ -2429,7 +2702,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let token = mint_token(
             &pem,
@@ -2457,7 +2730,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let token = mint_token(
             &pem,
@@ -2485,7 +2758,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         // Create a token that expired 2 minutes ago (past the 60s leeway).
         let encoding_key =
@@ -2520,7 +2793,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let token = mint_token(
             &pem,
@@ -2551,7 +2824,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         // Sign with attacker key but JWKS has legitimate public key.
         let token = mint_token(
@@ -2580,7 +2853,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let token = mint_token(
             &pem,
@@ -2603,7 +2876,7 @@ mod tests {
     async fn jwks_server_down_returns_none() {
         // Point to a non-existent server.
         let config = test_config("http://127.0.0.1:1/jwks.json");
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let kid = "orphan-key";
         let (pem, _) = generate_test_keypair(kid);
@@ -2700,7 +2973,208 @@ mod tests {
             ca_cert_path: None,
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
+            strict_audience_validation: false,
+            jwks_max_response_bytes: default_jwks_max_bytes(),
         }
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_rejects_literal_ip() {
+        let err = screen_oauth_target("https://127.0.0.1/jwks.json", false)
+            .await
+            .expect_err("literal IPs must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("literal IPv4 addresses are forbidden"));
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_rejects_private_dns_resolution() {
+        let err = screen_oauth_target("https://localhost/jwks.json", false)
+            .await
+            .expect_err("localhost resolution must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blocked IP") && msg.contains("loopback"),
+            "got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_rejects_literal_ip_even_with_allow_http() {
+        let err = screen_oauth_target("http://127.0.0.1/jwks.json", true)
+            .await
+            .expect_err("literal IPs must still be rejected when http is allowed");
+        let msg = err.to_string();
+        assert!(msg.contains("literal IPv4 addresses are forbidden"));
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_rejects_private_dns_even_with_allow_http() {
+        let err = screen_oauth_target("http://localhost/jwks.json", true)
+            .await
+            .expect_err("private DNS resolution must still be rejected when http is allowed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blocked IP") && msg.contains("loopback"),
+            "got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_allows_public_hostname() {
+        screen_oauth_target("https://example.com/.well-known/jwks.json", false)
+            .await
+            .expect("public hostname should pass screening");
+    }
+
+    #[tokio::test]
+    async fn audience_falls_back_to_azp_by_default() {
+        let kid = "test-audience-azp-default";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri);
+        let cache = test_cache(&config);
+
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://some-other-resource.example.com",
+                "azp": "https://mcp.test.local/mcp",
+                "sub": "compat-client",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        let identity = cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect("azp fallback should remain enabled by default");
+        assert_eq!(identity.role, "viewer");
+    }
+
+    #[tokio::test]
+    async fn strict_audience_validation_rejects_azp_only_match() {
+        let kid = "test-audience-azp-strict";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.strict_audience_validation = true;
+        let cache = test_cache(&config);
+
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://some-other-resource.example.com",
+                "azp": "https://mcp.test.local/mcp",
+                "sub": "strict-client",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        let failure = cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect_err("strict audience validation must ignore azp fallback");
+        assert_eq!(failure, JwtValidationFailure::Invalid);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    }
+
+    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogsWriter(Arc::clone(&self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn jwks_response_size_cap_returns_none_and_logs_warning() {
+        let kid = "oversized-jwks";
+        let (_pem, jwks) = generate_test_keypair(kid);
+        let mut oversized_body = serde_json::to_string(&jwks).expect("jwks json");
+        oversized_body.push_str(&" ".repeat(4096));
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(oversized_body),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.jwks_max_response_bytes = 256;
+        let cache = test_cache(&config);
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let result = cache.fetch_jwks().await;
+        assert!(result.is_none(), "oversized JWKS must be dropped");
+        assert!(
+            logs.contents()
+                .contains("JWKS response exceeded configured size cap"),
+            "expected cap-exceeded warning in logs"
+        );
     }
 
     #[tokio::test]
@@ -2730,7 +3204,7 @@ mod tests {
                 },
             ],
         );
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let now = jsonwebtoken::get_current_timestamp();
         let token = mint_token_with_claims(
@@ -2781,7 +3255,7 @@ mod tests {
                 },
             ],
         );
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let now = jsonwebtoken::get_current_timestamp();
         let token = mint_token_with_claims(
@@ -2826,7 +3300,7 @@ mod tests {
                 role: "ops".into(),
             }],
         );
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let now = jsonwebtoken::get_current_timestamp();
         let token = mint_token_with_claims(
@@ -2872,7 +3346,7 @@ mod tests {
                 },
             ],
         );
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let now = jsonwebtoken::get_current_timestamp();
         let token = mint_token_with_claims(
@@ -2911,7 +3385,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri); // role_claim: None, uses scopes
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         let token = mint_token(
             &pem,
@@ -2951,7 +3425,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = Arc::new(JwksCache::new(&config).unwrap());
+        let cache = Arc::new(test_cache(&config));
 
         // Create 5 concurrent validation requests with the same valid token.
         let token = mint_token(
@@ -2995,7 +3469,7 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let config = test_config(&jwks_uri);
-        let cache = JwksCache::new(&config).unwrap();
+        let cache = test_cache(&config);
 
         // First request with unknown kid triggers a refresh.
         let fake_token1 =
@@ -3027,6 +3501,7 @@ mod tests {
             introspection_url: None,
             revocation_url: None,
             expose_admin_endpoints: false,
+            require_auth_on_admin_endpoints: false,
         }
     }
 
@@ -3036,7 +3511,16 @@ mod tests {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        OauthHttpClient::with_config(&OAuthConfig::default()).expect("build test http client")
+        let config = OAuthConfig::builder(
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "https://auth.test.local/.well-known/jwks.json",
+        )
+        .allow_http_oauth_urls(true)
+        .build();
+        OauthHttpClient::with_config(&config)
+            .expect("build test http client")
+            .__test_allow_loopback_ssrf()
     }
 
     #[tokio::test]

@@ -633,18 +633,20 @@ pub(crate) async fn rbac_middleware(
         }
     };
 
-    // Try to parse as a JSON-RPC tool call.
-    if let Ok(msg) = serde_json::from_slice::<JsonRpcEnvelope>(&bytes)
-        && msg.method.as_deref() == Some("tools/call")
-    {
-        if let Some(resp) = enforce_rate_limit(tool_limiter.as_deref(), peer_ip) {
-            return resp;
-        }
-        if let Some(ref params) = msg.params
-            && policy.is_enabled()
-            && let Some(resp) = enforce_tool_policy(&policy, &identity_name, &role, params)
-        {
-            return resp;
+    // Try to parse as JSON and inspect JSON-RPC tool calls, including batch arrays.
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        let tool_calls = extract_tool_calls(&json);
+        if !tool_calls.is_empty() {
+            for params in tool_calls {
+                if let Some(resp) = enforce_rate_limit(tool_limiter.as_deref(), peer_ip) {
+                    return resp;
+                }
+                if policy.is_enabled()
+                    && let Some(resp) = enforce_tool_policy(&policy, &identity_name, &role, params)
+                {
+                    return resp;
+                }
+            }
         }
     }
     // Non-parseable or non-tool-call requests pass through.
@@ -668,11 +670,40 @@ pub(crate) async fn rbac_middleware(
     }
 }
 
-/// Minimal JSON-RPC envelope for extracting tool call info.
-#[derive(Deserialize)]
-struct JsonRpcEnvelope {
-    method: Option<String>,
-    params: Option<serde_json::Value>,
+/// Extract the `params` object for every top-level `tools/call` message.
+///
+/// Supports either a single JSON-RPC object or a JSON-RPC batch array. Any
+/// malformed elements are ignored so non-RPC payloads continue to pass through
+/// unchanged.
+fn extract_tool_calls(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .filter(|method| *method == "tools/call")
+            .and_then(|_| map.get("params"))
+            .into_iter()
+            .collect(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                serde_json::Value::Object(map) => map
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|method| *method == "tools/call")
+                    .and_then(|_| map.get("params")),
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_)
+                | serde_json::Value::Array(_) => None,
+            })
+            .collect(),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => Vec::new(),
+    }
 }
 
 /// Per-IP rate limit check for tool invocations. Returns `Some(response)`
@@ -1378,6 +1409,120 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn middleware_batch_all_allowed_passes() {
+        let policy = Arc::new(test_policy());
+        let id = AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "alice".into(),
+            role: "viewer".into(),
+            raw_token: None,
+            sub: None,
+        };
+        let app = rbac_router_with_identity(policy, id);
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "resource_list", "arguments": {} }
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "system_info", "arguments": {} }
+            }
+        ])
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn middleware_batch_with_denied_call_rejects_entire_batch() {
+        let policy = Arc::new(test_policy());
+        let id = AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "alice".into(),
+            role: "viewer".into(),
+            raw_token: None,
+            sub: None,
+        };
+        let app = rbac_router_with_identity(policy, id);
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "resource_list", "arguments": {} }
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "resource_delete", "arguments": {} }
+            }
+        ])
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn middleware_batch_mixed_allowed_and_denied_rejects() {
+        let policy = Arc::new(test_policy());
+        let id = AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "dev".into(),
+            role: "restricted-exec".into(),
+            raw_token: None,
+            sub: None,
+        };
+        let app = rbac_router_with_identity(policy, id);
+        let body = serde_json::json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "resource_exec",
+                    "arguments": { "cmd": "ls -la", "host": "dev-1" }
+                }
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "resource_exec",
+                    "arguments": { "cmd": "rm -rf /", "host": "dev-1" }
+                }
+            }
+        ])
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // -- redact_arg / redaction_salt tests --

@@ -75,7 +75,9 @@ async fn jwks_rejects_excess_keys_fail_closed() {
     config.max_jwks_keys = 256;
 
     // `JwksCache::new` does NOT fetch — only builds the reqwest client.
-    let cache = JwksCache::new(&config).expect("construct cache");
+    let cache = JwksCache::new(&config)
+        .expect("construct cache")
+        .__test_allow_loopback_ssrf();
 
     // Drive the refresh path that would normally happen on first
     // validate_token() call. The new __test_refresh_now helper surfaces
@@ -121,7 +123,9 @@ async fn jwks_at_cap_populates_successfully() {
     config.allow_http_oauth_urls = true;
     config.max_jwks_keys = 8;
 
-    let cache = JwksCache::new(&config).expect("construct cache");
+    let cache = JwksCache::new(&config)
+        .expect("construct cache")
+        .__test_allow_loopback_ssrf();
     cache
         .__test_refresh_now()
         .await

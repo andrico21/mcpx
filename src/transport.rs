@@ -1105,7 +1105,8 @@ where
         && let Some(ref oauth_config) = auth_config.oauth
         && oauth_config.proxy.is_some()
     {
-        router = install_oauth_proxy_routes(router, &server_url, oauth_config)?;
+        router =
+            install_oauth_proxy_routes(router, &server_url, oauth_config, auth_state.as_ref())?;
     }
 
     // OWASP security response headers (applied to all responses).
@@ -1552,6 +1553,7 @@ fn install_oauth_proxy_routes(
     router: axum::Router,
     server_url: &str,
     oauth_config: &crate::oauth::OAuthConfig,
+    auth_state: Option<&Arc<AuthState>>,
 ) -> Result<axum::Router, McpxError> {
     let Some(ref proxy) = oauth_config.proxy else {
         return Ok(router);
@@ -1601,35 +1603,60 @@ fn install_oauth_proxy_routes(
         }),
     );
 
-    let router = if proxy.expose_admin_endpoints && proxy.introspection_url.is_some() {
-        let proxy_introspect = proxy.clone();
-        let introspect_http = http.clone();
-        router.route(
-            "/introspect",
-            axum::routing::post(move |body: String| {
-                let p = proxy_introspect.clone();
-                let h = introspect_http.clone();
-                async move { crate::oauth::handle_introspect(&h, &p, &body).await }
-            }),
-        )
+    let admin_routes_enabled = proxy.expose_admin_endpoints
+        && (proxy.introspection_url.is_some() || proxy.revocation_url.is_some());
+    if proxy.expose_admin_endpoints && !proxy.require_auth_on_admin_endpoints {
+        tracing::warn!(
+            "OAuth introspect/revoke endpoints are unauthenticated; consider setting require_auth_on_admin_endpoints = true"
+        );
+    }
+
+    let admin_router = if admin_routes_enabled {
+        let mut admin_router = axum::Router::new();
+        if proxy.introspection_url.is_some() {
+            let proxy_introspect = proxy.clone();
+            let introspect_http = http.clone();
+            admin_router = admin_router.route(
+                "/introspect",
+                axum::routing::post(move |body: String| {
+                    let p = proxy_introspect.clone();
+                    let h = introspect_http.clone();
+                    async move { crate::oauth::handle_introspect(&h, &p, &body).await }
+                }),
+            );
+        }
+        if proxy.revocation_url.is_some() {
+            let proxy_revoke = proxy.clone();
+            let revoke_http = http;
+            admin_router = admin_router.route(
+                "/revoke",
+                axum::routing::post(move |body: String| {
+                    let p = proxy_revoke.clone();
+                    let h = revoke_http.clone();
+                    async move { crate::oauth::handle_revoke(&h, &p, &body).await }
+                }),
+            );
+        }
+
+        if proxy.require_auth_on_admin_endpoints {
+            let Some(state) = auth_state else {
+                return Err(McpxError::Startup(
+                    "oauth proxy admin endpoints require auth state".into(),
+                ));
+            };
+            let state_for_mw = Arc::clone(state);
+            admin_router.layer(axum::middleware::from_fn(move |req, next| {
+                let s = Arc::clone(&state_for_mw);
+                auth_middleware(s, req, next)
+            }))
+        } else {
+            admin_router
+        }
     } else {
-        router
+        axum::Router::new()
     };
 
-    let router = if proxy.expose_admin_endpoints && proxy.revocation_url.is_some() {
-        let proxy_revoke = proxy.clone();
-        let revoke_http = http;
-        router.route(
-            "/revoke",
-            axum::routing::post(move |body: String| {
-                let p = proxy_revoke.clone();
-                let h = revoke_http.clone();
-                async move { crate::oauth::handle_revoke(&h, &p, &body).await }
-            }),
-        )
-    } else {
-        router
-    };
+    let router = router.merge(admin_router);
 
     tracing::info!(
         introspect = proxy.expose_admin_endpoints && proxy.introspection_url.is_some(),

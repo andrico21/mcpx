@@ -236,7 +236,9 @@ fn build_client_with_ca(pki: &TestPki, allow_http: bool) -> (OauthHttpClient, Pa
     let mut config = OAuthConfig::default();
     config.ca_cert_path = Some(ca_path.clone());
     config.allow_http_oauth_urls = allow_http;
-    let client = OauthHttpClient::with_config(&config).expect("client builds");
+    let client = OauthHttpClient::with_config(&config)
+        .expect("client builds")
+        .__test_allow_loopback_ssrf();
     (client, ca_path)
 }
 
@@ -318,7 +320,9 @@ async fn redirect_to_non_http_scheme_is_rejected() {
     // The follow-up to ftp:// must still be refused.
     let mut config = OAuthConfig::default();
     config.allow_http_oauth_urls = true;
-    let client = OauthHttpClient::with_config(&config).expect("client builds");
+    let client = OauthHttpClient::with_config(&config)
+        .expect("client builds")
+        .__test_allow_loopback_ssrf();
 
     let url = format!("{}/redir", mock.uri());
     let result = client.__test_get(&url).await;
@@ -368,7 +372,9 @@ async fn redirect_chain_capped_at_two_hops() {
 
     let mut config = OAuthConfig::default();
     config.allow_http_oauth_urls = true;
-    let client = OauthHttpClient::with_config(&config).expect("client builds");
+    let client = OauthHttpClient::with_config(&config)
+        .expect("client builds")
+        .__test_allow_loopback_ssrf();
 
     let url = format!("{base}/a");
     let result = client.__test_get(&url).await;
@@ -418,7 +424,9 @@ async fn missing_ca_cert_path_makes_self_signed_request_fail() {
     let url = spawn_one_shot_tls(&pki, response_bytes).await;
 
     let config = OAuthConfig::default();
-    let client = OauthHttpClient::with_config(&config).expect("client builds");
+    let client = OauthHttpClient::with_config(&config)
+        .expect("client builds")
+        .__test_allow_loopback_ssrf();
     let result = client.__test_get(&url).await;
     let err = result.expect_err("untrusted self-signed leaf must be rejected");
     // We don't assert a specific error string (rustls phrasing varies
@@ -473,7 +481,9 @@ async fn rejects_per_hop_redirect_to_private_ip_oauth_client() {
 
     let mut config = OAuthConfig::default();
     config.allow_http_oauth_urls = true;
-    let client = OauthHttpClient::with_config(&config).expect("client builds");
+    let client = OauthHttpClient::with_config(&config)
+        .expect("client builds")
+        .__test_allow_loopback_ssrf();
 
     let url = format!("{}/redir", mock.uri());
     let result = client.__test_get(&url).await;
@@ -508,7 +518,9 @@ async fn rejects_per_hop_redirect_to_loopback_oauth_client() {
 
     let mut config = OAuthConfig::default();
     config.allow_http_oauth_urls = true;
-    let client = OauthHttpClient::with_config(&config).expect("client builds");
+    let client = OauthHttpClient::with_config(&config)
+        .expect("client builds")
+        .__test_allow_loopback_ssrf();
 
     let url = format!("{}/redir", mock.uri());
     let result = client.__test_get(&url).await;

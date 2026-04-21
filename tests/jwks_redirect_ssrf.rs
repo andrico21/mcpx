@@ -50,7 +50,9 @@ async fn jwks_cache_redirect_to_private_ip_rejected() {
     let mut config = OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
     config.allow_http_oauth_urls = true;
 
-    let cache = JwksCache::new(&config).expect("construct cache");
+    let cache = JwksCache::new(&config)
+        .expect("construct cache")
+        .__test_allow_loopback_ssrf();
     let err = cache
         .__test_refresh_now()
         .await
@@ -83,7 +85,9 @@ async fn jwks_cache_redirect_to_userinfo_rejected() {
     let mut config = OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
     config.allow_http_oauth_urls = true;
 
-    let cache = JwksCache::new(&config).expect("construct cache");
+    let cache = JwksCache::new(&config)
+        .expect("construct cache")
+        .__test_allow_loopback_ssrf();
     let err = cache
         .__test_refresh_now()
         .await
@@ -124,7 +128,9 @@ async fn jwks_cache_http_to_http_redirect_followed_when_http_allowed() {
     let mut config = OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
     config.allow_http_oauth_urls = true;
 
-    let cache = JwksCache::new(&config).expect("construct cache");
+    let cache = JwksCache::new(&config)
+        .expect("construct cache")
+        .__test_allow_loopback_ssrf();
     cache
         .__test_refresh_now()
         .await
@@ -159,7 +165,9 @@ async fn jwks_cache_http_to_http_redirect_rejected_when_http_disallowed() {
     let jwks_uri = format!("{base}/.well-known/jwks.json");
     let config = OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
 
-    let cache = JwksCache::new(&config).expect("construct cache");
+    let cache = JwksCache::new(&config)
+        .expect("construct cache")
+        .__test_allow_loopback_ssrf();
     let err = cache
         .__test_refresh_now()
         .await

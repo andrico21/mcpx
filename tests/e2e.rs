@@ -953,6 +953,7 @@ fn oauth_cfg_with_proxy(expose: bool) -> rmcp_server_kit::oauth::OAuthConfig {
             "introspection_url": "https://upstream.example/introspect",
             "revocation_url": "https://upstream.example/revoke",
             "expose_admin_endpoints": expose,
+            "require_auth_on_admin_endpoints": false,
         }
     });
     serde_json::from_value(json).expect("oauth config deserialization")
@@ -1058,6 +1059,59 @@ async fn c3_admin_endpoints_exposed_when_enabled() {
         resp.status(),
         404,
         "/introspect must be mounted when expose_admin_endpoints=true"
+    );
+}
+
+#[cfg(feature = "oauth")]
+#[tokio::test]
+async fn c3_admin_endpoints_can_require_auth() {
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let mut auth = AuthConfig::with_keys(vec![ApiKeyEntry::new("oauth-admin", hash, "ops")]);
+
+    let mut oauth = oauth_cfg_with_proxy(true);
+    if let Some(proxy) = oauth.proxy.as_mut() {
+        proxy.require_auth_on_admin_endpoints = true;
+    }
+    auth.oauth = Some(oauth);
+
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(auth)
+        .with_public_url(format!("http://127.0.0.1:{port}"));
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+
+    let unauth = client
+        .post(format!("{base}/introspect"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("token=abc")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(unauth.status().as_u16(), 401 | 403),
+        "expected 401/403 without auth, got {}",
+        unauth.status()
+    );
+
+    let authed = client
+        .post(format!("{base}/introspect"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("token=abc")
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        authed.status(),
+        401,
+        "authenticated caller must reach the proxy handler"
+    );
+    assert_ne!(
+        authed.status(),
+        403,
+        "authenticated caller must reach the proxy handler"
     );
 }
 
