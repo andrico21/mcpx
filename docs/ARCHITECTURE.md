@@ -105,8 +105,9 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 
 ```
 TCP / TLS handshake                         src/transport.rs:1720  (TlsListener)
-   │  - mTLS: client cert verified, AuthIdentity stored in
-   │    MtlsIdentities map keyed by peer SocketAddr
+   │  - mTLS: client cert verified during the handshake; the resulting
+   │    AuthIdentity is attached to the **per-connection** TlsConnInfo
+   │    extension (no shared SocketAddr-keyed map).
    ▼
 axum Router                                  src/transport.rs:810  (build_app_router)
    │
@@ -129,9 +130,12 @@ axum Router                                  src/transport.rs:810  (build_app_ro
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<HashMap>)
-   │        b) mTLS — look up AuthIdentity in MtlsIdentities by peer addr
+   │        b) mTLS — read AuthIdentity from the per-connection
+   │           TlsConnInfo extension (set by TlsListener at handshake time)
    │        c) Authorization: Bearer <jwt>      → JwksCache::validate
    │           (feature = "oauth")
+   │      Bearer scheme parsing is case-insensitive per RFC 7235 §2.1
+   │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
    ├── 7. RBAC middleware                    src/rbac.rs:584  (rbac_middleware) + 701 (enforce_tool_policy)
@@ -240,7 +244,11 @@ Generic wrapper around a consumer's `ServerHandler` that runs:
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:842`. It contains:
 - `api_keys: ArcSwap<HashMap<String, ApiKeyEntry>>` (`src/auth.rs:621-630`)
-- `mtls: Arc<MtlsIdentities>` (the shared `RwLock<HashMap<SocketAddr, AuthIdentity>>`)
+- mTLS identities: stored **per-connection** on the `TlsConnInfo` extension
+  (`src/auth.rs:594-602`, read by `auth_middleware` at `src/auth.rs:992-996`).
+  No shared `SocketAddr`-keyed map exists — the previous design was replaced
+  to avoid identity-binding races behind load balancers and to remove a
+  `RwLock` from the request hot path.
 - `rate_limiter: Option<Arc<KeyedLimiter>>` — **post-failure backoff**:
   governor limit on *failed* auth attempts per IP. Consulted only after a
   credential check has run and rejected the caller.
@@ -276,9 +284,12 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
 ### mTLS flow
 1. The `TlsListener` validates the client cert chain (configured roots).
 2. It extracts CN/SAN as `name`, derives `role` from the configured
-   subject→role mapping, and stores `AuthIdentity { method: Mtls, … }`
-   in `MtlsIdentities` keyed by **peer `SocketAddr`** (`src/transport.rs:1720-1900`).
-3. `auth_middleware` picks up the identity by the request's `ConnectInfo<SocketAddr>`.
+   subject→role mapping, and attaches `AuthIdentity { method: Mtls, … }`
+   to the **per-connection** `TlsConnInfo` extension
+   (`src/transport.rs:1720-1900`).
+3. `auth_middleware` reads the identity directly from the connection
+   extension (`src/auth.rs:992-996`); no shared SocketAddr-keyed map is
+   consulted, so there is no port-reuse aliasing risk.
 
 ### OAuth JWT flow (feature = `oauth`)
 See [§8](#8-oauth-21--jwks-feature-oauth).
@@ -381,7 +392,8 @@ Lifecycle:
 2. On each `accept()`:
    - Performs the TLS handshake.
    - If the peer presented a cert, parses it (`x509-parser`), derives
-     `AuthIdentity`, and writes to `MtlsIdentities` keyed by `SocketAddr`.
+     `AuthIdentity`, and stores it on the per-connection `TlsConnInfo`
+     extension that travels with the stream.
    - Returns the wrapped TLS stream + `ConnectInfo<TlsConnInfo>`.
 
 Configuration toggles:
@@ -630,13 +642,16 @@ Conventions used by rmcp-server-kit itself:
 
 **File**: `src/metrics.rs`. Activated by `features = ["metrics"]`.
 
-`McpMetrics` (`src/metrics.rs:26-93`) wraps a `prometheus::Registry` and
-records standard server metrics:
-- `rmcp_server_kit_requests_total{path, status}` (counter)
-- `rmcp_server_kit_request_duration_seconds{path}` (histogram)
-- `rmcp_server_kit_inflight_requests` (gauge)
-- `rmcp_server_kit_auth_failures_total{method}` (counter)
-- `rmcp_server_kit_rbac_denies_total{role, tool}` (counter)
+`McpMetrics` (`src/metrics.rs:33-82`) wraps a `prometheus::Registry` and
+records the following standard server metrics:
+- `rmcp_server_kit_http_requests_total{method, path, status}` (counter)
+- `rmcp_server_kit_http_request_duration_seconds{method, path}` (histogram,
+  buckets `[1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]`)
+
+Operators that need additional collectors (in-flight gauge, auth-failure
+counter, RBAC-deny counter, etc.) can register custom metrics against the
+shared `McpMetrics::registry`, which is intentionally part of the public
+API surface.
 
 The `/metrics` endpoint is served on a **separate listener** (often a
 private bind address) configured via `MetricsConfig` — see

@@ -230,6 +230,10 @@ impl<H: ServerHandler> fmt::Debug for HookedHandler<H> {
 }
 
 /// Construct a [`crate::tool_hooks::HookedHandler`] from an inner handler and hooks.
+///
+/// Returning the wrapped handler is the entire point of this function;
+/// dropping it on the floor would silently disable the supplied hooks.
+#[must_use]
 pub fn with_hooks<H: ServerHandler>(inner: H, hooks: Arc<ToolHooks>) -> HookedHandler<H> {
     HookedHandler {
         inner: Arc::new(inner),

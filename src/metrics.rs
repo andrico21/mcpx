@@ -15,10 +15,20 @@
 use std::sync::Arc;
 
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, Registry, TextEncoder, histogram_opts, opts,
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder, opts,
 };
 
 use crate::error::McpxError;
+
+/// Default Prometheus histogram buckets for HTTP request latency
+/// (seconds). Tuned for low-latency service work: sub-millisecond
+/// through five seconds, covering health-check fast paths up to slow
+/// outbound dependencies. Operators that need different buckets can
+/// register their own histogram against
+/// [`McpMetrics::registry`].
+const HTTP_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
 
 /// Collected Prometheus metrics for an MCP server.
 #[derive(Clone, Debug)]
@@ -52,10 +62,11 @@ impl McpMetrics {
             .map_err(|e| McpxError::Metrics(e.to_string()))?;
 
         let http_request_duration_seconds = HistogramVec::new(
-            histogram_opts!(
+            HistogramOpts::new(
                 "rmcp_server_kit_http_request_duration_seconds",
-                "HTTP request duration in seconds"
-            ),
+                "HTTP request duration in seconds",
+            )
+            .buckets(HTTP_DURATION_BUCKETS.to_vec()),
             &["method", "path"],
         )
         .map_err(|e| McpxError::Metrics(e.to_string()))?;

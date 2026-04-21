@@ -35,7 +35,14 @@ use x509_parser::prelude::*;
 use crate::{bounded_limiter::BoundedKeyedLimiter, error::McpxError};
 
 /// Identity of an authenticated caller.
-#[derive(Debug, Clone)]
+///
+/// The [`Debug`] impl is **manually written** to redact the raw bearer token
+/// and the JWT `sub` claim. This prevents accidental disclosure if an
+/// `AuthIdentity` is ever logged via `tracing::debug!(?identity, …)` or
+/// `format!("{identity:?}")`. Only `name`, `role`, and `method` are printed
+/// in the clear; `raw_token` and `sub` are rendered as `<redacted>` /
+/// `<present>` / `<none>` markers.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct AuthIdentity {
     /// Human-readable identity name (e.g. API key label or cert CN).
@@ -53,6 +60,34 @@ pub struct AuthIdentity {
     /// JWT `sub` claim (stable user identifier, e.g. Keycloak UUID).
     /// Used for token store keying. `None` for non-JWT auth.
     pub sub: Option<String>,
+}
+
+impl std::fmt::Debug for AuthIdentity {
+    /// Redacts `raw_token` and `sub` to prevent secret leakage via
+    /// `format!("{:?}")` or `tracing::debug!(?identity)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthIdentity")
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("method", &self.method)
+            .field(
+                "raw_token",
+                &if self.raw_token.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .field(
+                "sub",
+                &if self.sub.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .finish()
+    }
 }
 
 /// How the caller authenticated.
@@ -207,7 +242,12 @@ impl AuthCounters {
 }
 
 /// A single API key entry (stored as Argon2id hash in config).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// The [`Debug`] impl is **manually written** to redact the Argon2id hash.
+/// Although the hash is not directly reversible, treating it as a secret
+/// prevents offline brute-force attempts from leaked logs and matches the
+/// defense-in-depth posture used for [`AuthIdentity`].
+#[derive(Clone, Deserialize)]
 #[non_exhaustive]
 pub struct ApiKeyEntry {
     /// Human-readable key label (used in logs and audit records).
@@ -218,6 +258,19 @@ pub struct ApiKeyEntry {
     pub role: String,
     /// Optional expiry in RFC 3339 format.
     pub expires_at: Option<String>,
+}
+
+impl std::fmt::Debug for ApiKeyEntry {
+    /// Redacts the Argon2id `hash` to keep it out of logs, panic backtraces,
+    /// and admin-endpoint responses that might `format!("{:?}", …)` an entry.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyEntry")
+            .field("name", &self.name)
+            .field("hash", &"<redacted>")
+            .field("role", &self.role)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl ApiKeyEntry {
@@ -780,6 +833,30 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
     })
 }
 
+/// Extract the bearer token from an `Authorization` header value.
+///
+/// Implements RFC 7235 §2.1: the auth-scheme token is **case-insensitive**.
+/// `Bearer`, `bearer`, `BEARER`, and `BeArEr` all parse equivalently. Any
+/// leading whitespace between the scheme and the token is trimmed (per
+/// RFC 7235 the separator is one or more SP characters; we accept the
+/// common single-space form plus tolerate extras).
+///
+/// Returns `None` if the header value:
+/// - does not contain a space (no scheme/credentials boundary), or
+/// - uses a scheme other than `Bearer` (case-insensitively).
+///
+/// The caller is responsible for token-level validation (length, charset,
+/// signature, etc.); this helper only handles the scheme prefix.
+fn extract_bearer(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("Bearer") {
+        let token = rest.trim_start_matches(' ');
+        if token.is_empty() { None } else { Some(token) }
+    } else {
+        None
+    }
+}
+
 /// Verify a bearer token against configured API keys.
 ///
 /// Argon2id verification is CPU-intensive, so this should be called via
@@ -1004,7 +1081,7 @@ pub(crate) async fn auth_middleware(
     }
 
     let failure_class = if let Some(value) = req.headers().get(header::AUTHORIZATION) {
-        match value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")) {
+        match value.to_str().ok().and_then(extract_bearer) {
             Some(token) => match authenticate_bearer_identity(&state, token).await {
                 Ok(id) => {
                     state.log_auth(&id, auth_method_label(id.method));
@@ -1566,6 +1643,146 @@ mod tests {
         assert_eq!(
             counters.success_mtls, 3,
             "all three mTLS requests must have been counted as successful"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // RFC 7235 §2.1 case-insensitive scheme parsing for `extract_bearer`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extract_bearer_accepts_canonical_case() {
+        assert_eq!(extract_bearer("Bearer abc123"), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_bearer_is_case_insensitive_per_rfc7235() {
+        // RFC 7235 §2.1: "auth-scheme is case-insensitive".
+        // Real-world clients (curl, browsers, custom HTTP libs) emit varied
+        // casings; rejecting any of them is a spec violation.
+        for header in &[
+            "bearer abc123",
+            "BEARER abc123",
+            "BeArEr abc123",
+            "bEaReR abc123",
+        ] {
+            assert_eq!(
+                extract_bearer(header),
+                Some("abc123"),
+                "header {header:?} must parse as a Bearer token (RFC 7235 §2.1)"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_bearer_rejects_other_schemes() {
+        assert_eq!(extract_bearer("Basic dXNlcjpwYXNz"), None);
+        assert_eq!(extract_bearer("Digest username=\"x\""), None);
+        assert_eq!(extract_bearer("Token abc123"), None);
+    }
+
+    #[test]
+    fn extract_bearer_rejects_malformed() {
+        // Empty string, no separator, scheme-only, scheme + only whitespace.
+        assert_eq!(extract_bearer(""), None);
+        assert_eq!(extract_bearer("Bearer"), None);
+        assert_eq!(extract_bearer("Bearer "), None);
+        assert_eq!(extract_bearer("Bearer    "), None);
+    }
+
+    #[test]
+    fn extract_bearer_tolerates_extra_separator_whitespace() {
+        // Some non-conformant clients emit two spaces; we should still parse.
+        assert_eq!(extract_bearer("Bearer  abc123"), Some("abc123"));
+        assert_eq!(extract_bearer("Bearer   abc123"), Some("abc123"));
+    }
+
+    // -------------------------------------------------------------------
+    // Debug redaction: ensure `AuthIdentity` and `ApiKeyEntry` never leak
+    // secret material via `format!("{:?}", …)` or `tracing::debug!(?…)`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn auth_identity_debug_redacts_raw_token() {
+        let id = AuthIdentity {
+            name: "alice".into(),
+            role: "admin".into(),
+            method: AuthMethod::OAuthJwt,
+            raw_token: Some(SecretString::from("super-secret-jwt-payload-xyz")),
+            sub: Some("keycloak-uuid-2f3c8b".into()),
+        };
+        let dbg = format!("{id:?}");
+
+        // Plaintext fields must be visible (they are not secrets).
+        assert!(dbg.contains("alice"), "name should be visible: {dbg}");
+        assert!(dbg.contains("admin"), "role should be visible: {dbg}");
+        assert!(dbg.contains("OAuthJwt"), "method should be visible: {dbg}");
+
+        // Secret fields must NOT leak.
+        assert!(
+            !dbg.contains("super-secret-jwt-payload-xyz"),
+            "raw_token must be redacted in Debug output: {dbg}"
+        );
+        assert!(
+            !dbg.contains("keycloak-uuid-2f3c8b"),
+            "sub must be redacted in Debug output: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker missing: {dbg}"
+        );
+    }
+
+    #[test]
+    fn auth_identity_debug_marks_absent_secrets() {
+        // For non-OAuth identities (mTLS / API key) the secret fields are
+        // None; redacted Debug output should distinguish that from "present".
+        let id = AuthIdentity {
+            name: "viewer-key".into(),
+            role: "viewer".into(),
+            method: AuthMethod::BearerToken,
+            raw_token: None,
+            sub: None,
+        };
+        let dbg = format!("{id:?}");
+        assert!(
+            dbg.contains("<none>"),
+            "absent secrets should be marked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("<redacted>"),
+            "no <redacted> marker when secrets are absent: {dbg}"
+        );
+    }
+
+    #[test]
+    fn api_key_entry_debug_redacts_hash() {
+        let entry = ApiKeyEntry {
+            name: "viewer-key".into(),
+            // Realistic Argon2id PHC string (must NOT leak).
+            hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$h4sh3dPa55w0rd".into(),
+            role: "viewer".into(),
+            expires_at: Some("2030-01-01T00:00:00Z".into()),
+        };
+        let dbg = format!("{entry:?}");
+
+        // Non-secret fields visible.
+        assert!(dbg.contains("viewer-key"));
+        assert!(dbg.contains("viewer"));
+        assert!(dbg.contains("2030-01-01T00:00:00Z"));
+
+        // Hash material must NOT leak.
+        assert!(
+            !dbg.contains("$argon2id$"),
+            "argon2 hash leaked into Debug output: {dbg}"
+        );
+        assert!(
+            !dbg.contains("h4sh3dPa55w0rd"),
+            "hash digest leaked into Debug output: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker missing: {dbg}"
         );
     }
 }
