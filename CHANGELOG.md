@@ -8,6 +8,11 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-04-21
+
+Security and quality patch release rolling up the post-1.3.1 multi-agent
+review findings. No breaking changes; drop-in replacement for `1.3.1`.
+
 ### Security
 
 - **`src/auth.rs`** — Bearer-scheme parsing in the auth middleware is now case-insensitive per RFC 7235 §2.1 (e.g. `bearer …` and `BEARER …` are accepted alongside `Bearer …`). Previously these were silently rejected as `invalid_credential` and counted toward the auth-failure rate limit, which could cause spurious lockouts for spec-conformant clients.
