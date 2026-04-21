@@ -19,7 +19,7 @@
 #![allow(clippy::expect_used, reason = "tests")]
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
-#![cfg(feature = "oauth")]
+#![cfg(all(feature = "oauth", feature = "test-helpers"))]
 
 use rmcp_server_kit::oauth::{JwksCache, OAuthConfig};
 use serde_json::{Value, json};

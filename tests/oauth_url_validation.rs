@@ -11,6 +11,8 @@
 //!   IPv4 or IPv6 host in the URL string (any canonical form parsed by
 //!   [`url::Url`]).
 
+#![cfg(feature = "oauth")]
+
 use rmcp_server_kit::oauth::OAuthConfig;
 
 /// Build a minimal OAuthConfig with a given jwks_uri and allow_http flag.
