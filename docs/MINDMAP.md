@@ -183,8 +183,8 @@ mindmap
       ArcSwap lock-free
         AuthState.api_keys
         rbac_swap RbacPolicy
-      RwLock
-        MtlsIdentities by SocketAddr
+      Per-connection extension
+        mTLS AuthIdentity on TlsConnInfo
       Task-local
         Set by middleware
         Read by tool handlers
@@ -326,7 +326,7 @@ flowchart LR
     subgraph SharedState["Shared state (lock-free / fine-grained)"]
         AKS[(ArcSwap&lt;ApiKeys&gt;<br/>AuthState.api_keys<br/>src/auth.rs:623)]
         RBS[(ArcSwap&lt;RbacPolicy&gt;<br/>rbac_swap)]
-        MTL[(RwLock&lt;MtlsIdentities&gt;<br/>by SocketAddr)]
+        MTL[mTLS AuthIdentity<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:594-602]
     end
 
     subgraph Hot["Request-time consumers"]

@@ -18,10 +18,15 @@ handles everything else.
 
 ```toml
 [dependencies]
-rmcp-server-kit = { version = "1", features = ["oauth"] }
+rmcp-server-kit = "1"
 rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```
+
+> The minimal example below uses default features only. Enable the
+> `oauth` feature (`features = ["oauth"]`) to validate JWTs against a
+> JWKS, or `metrics` for the Prometheus `/metrics` endpoint -- see the
+> [Cargo features](#cargo-features) table below.
 
 ```rust
 use rmcp_server_kit::transport::{McpServerConfig, serve};
