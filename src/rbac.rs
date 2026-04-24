@@ -457,9 +457,31 @@ impl RbacPolicy {
     /// Check whether `value` passes the argument allowlists for `tool` under `role`.
     ///
     /// If the role has no matching `argument_allowlists` entry for the tool,
-    /// all values are allowed. When a matching entry exists, the first
-    /// whitespace-delimited token of `value` (or its `/`-basename) must
-    /// appear in the `allowed` list.
+    /// all values are allowed. When a matching entry exists, `value` is
+    /// tokenized using POSIX-shell-like lexical rules ([`shlex::split`])
+    /// and its first argv element (or the `/`-basename of that element)
+    /// must appear in the `allowed` list.
+    ///
+    /// **Scope of the contract.** This matcher targets consumers that
+    /// interpret string arguments as POSIX-shell-like command lines on
+    /// Unix-like systems (e.g. anything that subsequently feeds the value
+    /// through `shlex` or an equivalent splitter before `execve`). It
+    /// does **not** model real shell *execution* grammar (`FOO=1 cmd`,
+    /// expansion, command substitution, redirection, operators) or
+    /// Windows command-line tokenization (`CommandLineToArgvW`,
+    /// `cmd.exe`, PowerShell). Consumers in those regimes remain subject
+    /// to a parser differential and must validate at their own boundary.
+    ///
+    /// **Fail-closed cases (all return `false` when a matching allowlist
+    /// entry exists):**
+    ///
+    /// - `value` fails to parse as a POSIX-shell-like command line
+    ///   (e.g. unbalanced quotes, dangling escape).
+    /// - `value` parses to zero tokens (empty input).
+    /// - The first parsed token is the empty string (e.g.
+    ///   `value = r#""""#` parses to `Some(vec![""])`). An empty argv
+    ///   element is never a runnable executable, so we reject even when
+    ///   `""` is in the allowlist.
     #[must_use]
     pub fn argument_allowed(&self, role: &str, tool: &str, argument: &str, value: &str) -> bool {
         if !self.enabled {
@@ -478,10 +500,29 @@ impl RbacPolicy {
             if al.allowed.is_empty() {
                 continue;
             }
-            // Match the first token (the executable / keyword).
-            let first_token = value.split_whitespace().next().unwrap_or(value);
-            // Also match against the basename if it's a path.
-            let basename = first_token.rsplit('/').next().unwrap_or(first_token);
+            // Tokenize per POSIX-shell-like rules so quoted paths with
+            // spaces match what an equivalently-tokenizing consumer
+            // would actually run, and malformed shell syntax (unbalanced
+            // quotes, dangling escapes) fails closed.
+            let Some(tokens) = shlex::split(value) else {
+                return false;
+            };
+            let Some(first_token) = tokens.first() else {
+                return false;
+            };
+            // A well-formed but empty first argv element (e.g.
+            // value = r#""""#) is never a runnable executable. Fail
+            // closed even if "" appears in the allowlist.
+            if first_token.is_empty() {
+                return false;
+            }
+            // Also match against the basename if it's a path. POSIX
+            // separator only; Windows-style backslash paths are out of
+            // scope and will not basename-match (see crate-level docs).
+            let basename = first_token
+                .rsplit('/')
+                .next()
+                .unwrap_or(first_token.as_str());
             if !al.allowed.iter().any(|a| a == first_token || a == basename) {
                 return false;
             }
@@ -1132,6 +1173,114 @@ mod tests {
     fn argument_denied_unknown_role() {
         let policy = test_policy();
         assert!(!policy.argument_allowed("unknown", "resource_exec", "cmd", "sh"));
+    }
+
+    // -- shlex-tokenization regression tests (1.4.1) --
+    //
+    // These tests pin the POSIX-shell-like tokenization contract added
+    // in 1.4.1. See `RbacPolicy::argument_allowed` doc comment for the
+    // full contract; see CHANGELOG.md `[1.4.1]` for the behavior matrix.
+
+    /// Helper: build a minimal enabled policy with a single argument
+    /// allowlist on tool `run`, argument `cmd`.
+    fn shlex_policy(allowed: Vec<String>) -> RbacPolicy {
+        let role = RoleConfig::new("viewer", vec!["run".into()], vec!["*".into()])
+            .with_argument_allowlists(vec![ArgumentAllowlist::new("run", "cmd", allowed)]);
+        let mut config = RbacConfig::with_roles(vec![role]);
+        config.enabled = true;
+        RbacPolicy::new(&config)
+    }
+
+    #[test]
+    fn argument_allowed_matches_quoted_path_with_spaces() {
+        let policy = shlex_policy(vec!["/usr/bin/my tool".into()]);
+        assert!(policy.argument_allowed("viewer", "run", "cmd", r#""/usr/bin/my tool" --flag"#));
+    }
+
+    #[test]
+    fn argument_allowed_matches_basename_of_quoted_path() {
+        let policy = shlex_policy(vec!["my tool".into()]);
+        assert!(policy.argument_allowed("viewer", "run", "cmd", r#""/usr/bin/my tool" --flag"#));
+    }
+
+    #[test]
+    fn argument_allowed_fails_closed_on_unbalanced_quote() {
+        let policy = shlex_policy(vec!["unbalanced".into()]);
+        assert!(!policy.argument_allowed("viewer", "run", "cmd", r"unbalanced 'quote"));
+    }
+
+    #[test]
+    fn argument_allowed_fails_closed_on_empty_string() {
+        let policy = shlex_policy(vec![String::new()]);
+        assert!(!policy.argument_allowed("viewer", "run", "cmd", ""));
+    }
+
+    #[test]
+    fn argument_allowed_handles_single_quoted_executable() {
+        let policy = shlex_policy(vec!["/bin/sh".into()]);
+        assert!(policy.argument_allowed("viewer", "run", "cmd", r"'/bin/sh' -c 'echo hi'"));
+    }
+
+    #[test]
+    fn argument_allowed_handles_tab_separator() {
+        let policy = shlex_policy(vec!["ls".into()]);
+        assert!(policy.argument_allowed("viewer", "run", "cmd", "ls\t/etc/passwd"));
+    }
+
+    #[test]
+    fn argument_allowed_plain_token_unchanged() {
+        let policy = shlex_policy(vec!["ls".into()]);
+        assert!(policy.argument_allowed("viewer", "run", "cmd", "ls"));
+    }
+
+    // Per Oracle review: the next four tests pin the cases the original
+    // handoff missed. Each confirms the *new* (1.4.1) deny behavior so a
+    // future regression to the old `split_whitespace` semantics would
+    // surface as a test failure.
+
+    #[test]
+    fn argument_allowed_fails_closed_on_quoted_empty_first_token() {
+        // value r#""""# parses to Some(vec![""]). An empty argv element
+        // is never a runnable executable; deny even when "" is
+        // explicitly allowlisted.
+        let policy = shlex_policy(vec![String::new()]);
+        assert!(!policy.argument_allowed("viewer", "run", "cmd", r#""""#));
+    }
+
+    #[test]
+    fn argument_allowed_quoted_literal_token_no_longer_matches() {
+        // 1.4.0 behavior: split_whitespace first token = "'bash'" --
+        //                 matched literal allowlist entry "'bash'".
+        // 1.4.1 behavior: shlex strips the surrounding quotes -> first
+        //                 token = "bash" -- no match against allowlist
+        //                 entry "'bash'". Deny.
+        let policy = shlex_policy(vec!["'bash'".into()]);
+        assert!(!policy.argument_allowed("viewer", "run", "cmd", "'bash' -c true"));
+    }
+
+    #[test]
+    fn argument_allowed_backslash_literal_token_no_longer_matches() {
+        // 1.4.0 behavior: literal first token "foo\\bar" matched.
+        // 1.4.1 behavior: POSIX shlex treats backslash as escape ->
+        //                 first token = "foobar". Allowlist entry with
+        //                 a literal backslash no longer matches. Deny.
+        let policy = shlex_policy(vec![r"foo\bar".into()]);
+        assert!(!policy.argument_allowed("viewer", "run", "cmd", r"foo\bar --x"));
+    }
+
+    #[test]
+    fn argument_allowed_windows_path_no_longer_matches() {
+        // 1.4.0 behavior: literal Windows path matched.
+        // 1.4.1 behavior: POSIX shlex eats backslashes -> path identity
+        //                 changes; allowlist entry no longer matches.
+        //                 Deny. Documented in CHANGELOG operator notes.
+        let policy = shlex_policy(vec![r"C:\Windows\System32\cmd.exe".into()]);
+        assert!(!policy.argument_allowed(
+            "viewer",
+            "run",
+            "cmd",
+            r"C:\Windows\System32\cmd.exe /c dir"
+        ));
     }
 
     // -- host_patterns tests --

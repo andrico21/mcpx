@@ -18,10 +18,10 @@
 //!    key must verify against itself, regardless of the surrounding
 //!    timing or noise from co-generated keys.
 //! 2. **`argument_allowed` monotonicity** -- when an allowlist contains
-//!    a value, that value's *first whitespace token* must be accepted;
-//!    when an allowlist is non-empty and does NOT contain the value,
-//!    the value must be rejected. This guards against silent regressions
-//!    in the `glob_match` / basename matching path.
+//!    a value, that value's *first POSIX-shell argv element* must be
+//!    accepted; when an allowlist is non-empty and does NOT contain the
+//!    value, the value must be rejected. This guards against silent
+//!    regressions in the `glob_match` / basename matching path.
 //! 3. **Tool-name glob safety** -- patterns built from random
 //!    alphanumeric strings + `*` wildcards must never panic when matched
 //!    against arbitrary tool names. (Catches regex/glob-engine

@@ -8,6 +8,83 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-04-24
+
+Patch release fixing a tokenization bug in `RbacPolicy::argument_allowed`
+that prevented allowlist entries containing spaces from ever matching,
+and tightening fail-closed handling of malformed shell input.
+
+### Fixed
+
+- **`src/rbac.rs`** -- `RbacPolicy::argument_allowed` now tokenizes
+  argument values with POSIX-shell-like lexical rules (`shlex::split`)
+  instead of `str::split_whitespace`. Allowlist entries containing
+  spaces (e.g. `/usr/bin/my tool`) now match correctly when the value
+  quotes the path per shell rules; previously they were unmatchable.
+  Malformed shell syntax (unbalanced quotes, dangling escapes), empty
+  `value`, and well-formed but empty first argv elements (e.g.
+  `value = r#""""#`) now fail closed.
+
+### Behavior change matrix
+
+POSIX-shell-like tokenization is now the contract. The new behavior
+diverges from `str::split_whitespace` in the cases below. We ship as a
+patch because (a) the function signature is unchanged, (b) the
+"now-allow" change unbreaks legitimately-quoted spaced paths, and
+(c) every "now-deny" change is either malformed input or a
+configuration that worked only by accident under whitespace splitting
+and almost certainly diverged from the consumer's actual exec
+tokenization downstream.
+
+| Input class | 1.4.0 | 1.4.1 | Direction |
+|---|---|---|---|
+| Plain unquoted token (`ls`) | allow if listed | allow if listed | identical |
+| Quoted path with embedded space (e.g. `"/usr/bin/my tool" --x`) | deny (broken) | allow if listed | stricter-correct |
+| Unbalanced quote / dangling escape | accepts truncation | **deny** | stricter (security-positive) |
+| Empty input string `""` | accepts `""` if listed | **deny** | stricter |
+| Quoted empty token `r#""""#` | accepts `""` if listed | **deny** | stricter |
+| Tab/newline separator | works incidentally | works per POSIX | identical in practice |
+| Quoted-literal allowlist entry (e.g. `["'bash'"]` matching `'bash' -c true`) | allow | **deny** (shlex strips the surrounding quotes -> first token `bash`, not `'bash'`) | observable regression -- see operator notes |
+| Backslash-literal allowlist entry (e.g. `[r"foo\bar"]`) | allow | **deny** (POSIX shlex treats `\` as escape -> first token becomes `foobar`) | observable regression -- see operator notes |
+| Windows-style path allowlist entry (e.g. `[r"C:\Windows\System32\cmd.exe"]`) | allow | **deny** (POSIX shlex eats backslashes) | observable regression -- see operator notes |
+
+### Notes for operators
+
+- **POSIX-shell-like semantics only.** The matcher now models POSIX
+  word-splitting + quote removal as performed by `shlex::split`. It
+  does **not** model real shell *execution* (`FOO=1 cmd`, expansions,
+  command substitution, redirections, operators) or Windows
+  command-line tokenization (`CommandLineToArgvW`, `cmd.exe`,
+  PowerShell). Consumers in those regimes still need their own
+  validation at the boundary.
+- **Backslash is an escape character** under POSIX rules. Allowlist
+  entries that embed `\` (e.g. Windows-style paths) must be quoted at
+  the policy boundary, expressed with forward slashes, or migrated to
+  a typed pre-tokenized argument matcher in a future release.
+- **Quoted literals in the allowlist** (e.g. `"'bash'"`) no longer
+  match. These configurations were never sound -- they only worked
+  because the old `split_whitespace` first token also retained the
+  quote characters as literals, which any execve-aware consumer would
+  immediately strip. Update such entries to the bare command name
+  (`"bash"`) or its full path.
+- **Performance:** `shlex::split` allocates a `Vec<String>` for the
+  full input on every matched allowlist entry, where the previous
+  implementation only walked to the first whitespace. Acceptable under
+  existing request-body caps; observable on adversarial input.
+
+### API surface
+
+API surface unchanged: signature of `RbacPolicy::argument_allowed`
+(`fn(&self, role: &str, tool: &str, argument: &str, value: &str) -> bool`)
+is preserved. `cargo semver-checks` confirms patch-level compatibility.
+
+### Dependencies
+
+- Added `shlex = "1.3"` (MIT/Apache-2.0, zero transitive deps). Pinned
+  to `>=1.3` to stay on the post-RUSTSEC-2024-0006 line; that advisory
+  affects `shlex::quote` / `shlex::join` (CVE-2024-58266), neither of
+  which is consumed here.
+
 ## [1.4.0] - 2026-04-24
 
 Minor release adding an opt-in operator allowlist for the OAuth/JWKS
