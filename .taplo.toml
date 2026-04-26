@@ -1,0 +1,9 @@
+# taplo configuration
+# https://taplo.tamasfe.dev/configuration/file.html
+#
+# Scopes taplo's recursive file discovery to source-tracked TOML so
+# `taplo fmt --check` / `taplo lint` ignore build artifacts and vendored
+# package snapshots that live under `target/`.
+
+include = ["**/*.toml"]
+exclude = ["target/**", "vendor/**", ".git/**"]
