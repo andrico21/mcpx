@@ -115,21 +115,11 @@ clippy:
     # consumers.
     - rtk cargo clippy --all-targets --all-features -- -D warnings
 
-typos:
-  stage: lint
-  needs: []
-  # Advisory: catches typos in docs/code but should not gate merges
-  # while baseline corrections land. Promote to required once clean.
-  allow_failure: true
-  script:
-    - rtk typos
-
 taplo:
   stage: lint
   needs: []
-  # Advisory: enforces TOML formatting/lint. Pre-existing files do not
-  # match taplo defaults; flip to required after a one-shot reformat.
-  allow_failure: true
+  # Required: enforces canonical TOML formatting + lint on all *.toml.
+  # Run `taplo fmt` locally to fix any drift before pushing.
   script:
     - rtk taplo fmt --check
     - rtk taplo lint
