@@ -1,0 +1,25 @@
+# nextest profiles. The default profile mirrors `cargo test` ergonomics
+# for local use; the `ci` profile produces machine-readable JUnit XML
+# consumed by GitLab's native test report UI.
+#
+# See https://nexte.st/book/configuration.html
+
+[profile.default]
+# Show test output for failures only; keep local logs clean.
+failure-output = "immediate-final"
+success-output = "never"
+fail-fast = false
+
+[profile.ci]
+# CI: collect everything, retry transient failures once, emit JUnit XML.
+failure-output = "immediate-final"
+success-output = "never"
+fail-fast = false
+retries = 1
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "rmcp-server-kit"
+store-success-output = false
+store-failure-output = true

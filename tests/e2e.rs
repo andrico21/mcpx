@@ -783,6 +783,13 @@ mod crl_tests {
 
     #[tokio::test]
     async fn crl_allows_unrevoked_client() {
+        // Each test runs in its own process under cargo-nextest, so each
+        // test that touches rustls (directly or transitively, e.g. via
+        // `wiremock::MockServer` -> reqwest) must install the default
+        // crypto provider itself. Idempotent across tests in the same
+        // process (returns Err if already installed; we ignore it).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let mock_server = MockServer::start().await;
         let pki = build_test_pki(&format!("{}/ca.crl", mock_server.uri()), 100, &[]);
         let verifier = build_verifier(&pki);
@@ -793,6 +800,10 @@ mod crl_tests {
 
     #[tokio::test]
     async fn crl_rejects_revoked_client() {
+        // See `crl_allows_unrevoked_client` for the rationale; same
+        // requirement applies here.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let mock_server = MockServer::start().await;
         let pki = build_test_pki(&format!("{}/ca.crl", mock_server.uri()), 101, &[101]);
         let verifier = build_verifier(&pki);

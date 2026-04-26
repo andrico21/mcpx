@@ -1,85 +1,399 @@
-# GitLab CI template for rmcp-server-kit.
-# Host-neutral alternative to .github/workflows/ — use whichever matches
-# your repository host.
+# GitLab CI for rmcp-server-kit.
+#
+# Mirrors and extends the canonical GitHub Actions pipeline
+# (.github/workflows/ci.yml + release.yml). Linux-only on GitLab; the
+# GitHub workflows continue to provide macOS/Windows coverage.
+#
+# Toolchain image: ci-tools/rust-ci-images (built separately).
+# It pre-installs:
+#   - rustup channels: 1.95.0 (stable pin) + nightly (rustfmt, clippy,
+#     rust-src, llvm-tools-preview)
+#   - cargo subcommands: nextest, llvm-cov, deny, audit, semver-checks,
+#     vet, machete, mutants, msrv, hack, outdated, sort, upgrades, geiger,
+#     udeps, tarpaulin, criterion, expand, watch, edit, license, depgraph,
+#     bloat, asm, fuzz
+#   - system bins: jq, python3, gawk, openssl, lychee, taplo, typos,
+#     committed
+#   - rtk (token-killer log filter, latest at image build time)
+#
+# Conventions:
+#   * `rtk` wraps every cargo invocation that produces meaningful output;
+#     pure-confirmation commands (rustup add, cargo install) skip it.
+#   * Tests run via `cargo nextest` (JUnit XML -> GitLab native UI).
+#   * Coverage via `cargo llvm-cov` (lcov -> GitLab native UI).
+#   * Cache keyed on Cargo.toml hash + job, scoped per branch.
+#   * MR pipelines run the full required gate; main re-runs everything
+#     plus publish-dry-run; tags run the release job.
 
 include:
   - template: Security/SAST.gitlab-ci.yml
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 stages:
-  - lint
-  - test
-  - audit
-  - release
+  - scan      # SAST, secret detection
+  - lint      # fmt, clippy, typos, taplo, machete, deny, audit
+  - check     # MSRV build, feature matrix, semver-checks
+  - test      # nextest, doctests, coverage, docs-validate, memory-bounds
+  - docs      # rustdoc + SECURITY.md citation grep
+  - deep      # bench thresholds, vet (advisory)
+  - nightly   # mutants (schedule-only)
+  - release   # publish to crates.io on tag
 
 variables:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  RUST_STABLE: "1.95.0"
+  CARGO_INCREMENTAL: "0"          # CI cache hit-rate > incremental gain
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  # Pin to the rust-ci-images tag matching our MSRV. Bump deliberately
+  # together with Cargo.toml `rust-version`.
+  CI_IMAGE: gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.95.0
+  # SAST/secret-detection toggles (templates honour these).
   SECRET_DETECTION_ENABLED: "true"
-
-sast:
-  stage: audit
-
-secret_detection:
-  stage: audit
+  SAST_EXCLUDED_PATHS: "target,docs"
 
 default:
-  image: rust:${RUST_STABLE}
-  cache:
-    key: "$CI_COMMIT_REF_SLUG"
-    paths:
-      - .cargo/
-      - target/
+  image: $CI_IMAGE
+  interruptible: true
+  tags:
+    - linux
   before_script:
     - rustc --version
     - cargo --version
+    - rtk --version || true
+  cache:
+    # Per-branch + per-Cargo.toml cache. Falls back to main on miss.
+    key:
+      files:
+        - Cargo.toml
+      prefix: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/registry/cache
+      - .cargo/registry/index
+      - .cargo/git/db
+      - target
+    policy: pull-push
+
+# Run on: branch pushes, MRs, scheduled, manual, tags. Avoid duplicate
+# pipelines (branch + MR for the same commit).
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# ---------------------------------------------------------------------------
+# Scan stage (provided by GitLab templates; just pin the stage name)
+# ---------------------------------------------------------------------------
+
+sast:
+  stage: scan
+
+secret_detection:
+  stage: scan
+
+# ---------------------------------------------------------------------------
+# Lint stage
+# ---------------------------------------------------------------------------
 
 fmt:
   stage: lint
-  image: rustlang/rust:nightly
+  needs: []
   script:
-    - rustup component add rustfmt
-    - cargo +nightly fmt --all -- --check
+    - rtk cargo +nightly fmt --all -- --check
 
 clippy:
   stage: lint
+  needs: []
   script:
-    - rustup component add clippy
-    - cargo clippy --all-targets --all-features -- -D warnings
+    # Library crate: no committed Cargo.lock (it's .gitignored). Don't
+    # pass --locked here; let cargo resolve as it does for downstream
+    # consumers.
+    - rtk cargo clippy --all-targets --all-features -- -D warnings
+
+typos:
+  stage: lint
+  needs: []
+  # Advisory: catches typos in docs/code but should not gate merges
+  # while baseline corrections land. Promote to required once clean.
+  allow_failure: true
+  script:
+    - rtk typos
+
+taplo:
+  stage: lint
+  needs: []
+  # Advisory: enforces TOML formatting/lint. Pre-existing files do not
+  # match taplo defaults; flip to required after a one-shot reformat.
+  allow_failure: true
+  script:
+    - rtk taplo fmt --check
+    - rtk taplo lint
+
+machete:
+  stage: lint
+  needs: []
+  script:
+    - rtk cargo machete
+
+deny:
+  stage: lint
+  needs: []
+  script:
+    - rtk cargo deny check
+
+audit:
+  stage: lint
+  needs: []
+  script:
+    # Library crate has no committed Cargo.lock; generate one for audit.
+    - cargo generate-lockfile
+    - rtk cargo audit
+
+# ---------------------------------------------------------------------------
+# Check stage: build & feature matrix
+# ---------------------------------------------------------------------------
+
+msrv:
+  stage: check
+  needs: []
+  script:
+    # Image's stable channel is already pinned to MSRV (1.95.0). If a
+    # downstream image bump moves stable forward, switch this to
+    # `cargo +1.95.0 build` and add the toolchain via `rustup install`.
+    # Library crate: no committed Cargo.lock; do not pass --locked.
+    - rtk cargo build --all-features
+
+.feature-build:
+  stage: check
+  needs: []
+  parallel:
+    matrix:
+      - FEATURES: ""
+      - FEATURES: "--no-default-features"
+      - FEATURES: "--features oauth"
+      - FEATURES: "--features metrics"
+      - FEATURES: "--all-features"
+
+feature-matrix:build:
+  extends: .feature-build
+  script:
+    - rtk cargo build $FEATURES
+
+feature-matrix:test:
+  extends: .feature-build
+  needs:
+    - job: feature-matrix:build
+      artifacts: false
+  script:
+    - rtk cargo nextest run $FEATURES --no-fail-fast
+
+semver-checks:
+  stage: check
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - rtk cargo semver-checks check-release
+
+# ---------------------------------------------------------------------------
+# Test stage: nextest + doctests + coverage + extras
+# ---------------------------------------------------------------------------
 
 test:
   stage: test
+  needs: []
   script:
-    - cargo test --all-features
+    - rtk cargo nextest run --all-features --no-fail-fast --profile ci
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: target/nextest/ci/junit.xml
+    paths:
+      - target/nextest/ci/junit.xml
 
-docs:
+doctests:
   stage: test
-  image: rustlang/rust:nightly
+  needs: []
+  script:
+    # nextest does not run doctests; do them with `cargo test --doc`.
+    - rtk cargo test --doc --all-features
+
+coverage:
+  stage: test
+  needs: []
+  variables:
+    # llvm-cov needs the `nightly` rustflags trick disabled; force stable.
+    RUSTFLAGS: ""
+  script:
+    - rtk cargo llvm-cov nextest --all-features --lcov --output-path lcov.info
+    # Produce a human-readable summary so the job log shows the percentage.
+    - rtk cargo llvm-cov report --summary-only
+  coverage: '/^TOTAL.*?(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: lcov.info
+    paths:
+      - lcov.info
+
+memory-bounds:
+  stage: test
+  needs: []
+  script:
+    - rtk cargo nextest run --release --all-features --test limiter_memory --run-ignored only --no-fail-fast
+
+docs-validate:
+  stage: test
+  needs: []
+  script:
+    - rtk cargo nextest run --all-features --test docs_citations
+    - rtk lychee --offline --no-progress README.md docs/*.md
+
+# ---------------------------------------------------------------------------
+# Docs stage: rustdoc + SECURITY.md grep gates (mirrors GitHub `docs` job)
+# ---------------------------------------------------------------------------
+
+rustdoc:
+  stage: docs
+  needs: []
   variables:
     RUSTDOCFLAGS: "-D warnings --cfg docsrs"
   script:
-    - cargo +nightly doc --no-deps --all-features
+    - rtk cargo +nightly doc --no-deps --all-features
+    # Mirrors the SECURITY.md / GUIDE.md grep gates from GitHub CI.
+    - grep -q "Certificate revocation" SECURITY.md
+    - grep -qE "CDP[- ]driven CRL" SECURITY.md
+    - grep -q "crl_deny_on_unavailable" SECURITY.md
+    - grep -qE "OCSP is (\*\*)?not(\*\*)? implemented" SECURITY.md
+    - grep -qE "(short-lived|24h|24 hour)" SECURITY.md
+    - grep -qE "(cert-manager|Vault PKI|Smallstep)" docs/GUIDE.md
+  artifacts:
+    when: on_success
+    expire_in: 1 week
+    paths:
+      - target/doc
 
-deny:
-  stage: audit
+publish-dryrun:
+  stage: docs
+  needs: []
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - cargo install --locked cargo-deny
-    - cargo deny check
+    - rtk cargo publish --dry-run --all-features
 
-audit:
-  stage: audit
+# ---------------------------------------------------------------------------
+# Deep stage: benches + advisory checks
+# ---------------------------------------------------------------------------
+
+bench-thresholds:
+  stage: deep
+  needs: []
+  # Allowed to fail until baseline stabilises; matches GitHub
+  # `continue-on-error: true` semantics.
+  allow_failure: true
   script:
-    - cargo install --locked cargo-audit
-    - cargo audit
+    - rtk cargo bench --bench rbac_redaction
+    - bash scripts/check-bench-threshold.sh bench_redact_arg 10000
+    - rtk cargo bench --bench hook_latency
+    - bash scripts/check-bench-overhead.sh hook_latency_hooked hook_latency_bare 2000
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - target/criterion
+
+vet:
+  stage: deep
+  needs: []
+  allow_failure: true
+  script:
+    - cargo generate-lockfile
+    # `cargo vet` exits non-zero until a baseline is committed; treat as
+    # informational (matches GitHub job's `|| true`).
+    - rtk cargo vet --locked || true
+
+# ---------------------------------------------------------------------------
+# Nightly stage: scheduled-only mutation tests
+# ---------------------------------------------------------------------------
+
+mutants:
+  stage: nightly
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+  allow_failure: true
+  timeout: 4h
+  script:
+    - rtk cargo mutants --no-shuffle --timeout 300 -f src/rbac.rs -f src/auth.rs -f src/oauth.rs || true
+  artifacts:
+    when: always
+    expire_in: 1 month
+    paths:
+      - mutants.out
+
+# ---------------------------------------------------------------------------
+# Release stage: tag-triggered publish to crates.io
+# ---------------------------------------------------------------------------
 
 publish:
   stage: release
+  needs: []
   rules:
-    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+$/
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+(-.*)?$/
+  variables:
+    # Don't fail-loud on missing CARGO_REGISTRY_TOKEN: explicit check below
+    # gives a clearer error than `cargo publish` would.
+    GIT_DEPTH: "0"
   script:
-    - TAG="${CI_COMMIT_TAG}"
-    - CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rmcp-server-kit") | .version')
-    - test "$TAG" = "$CRATE_VERSION"
-    - cargo publish --dry-run --all-features
-    - cargo publish --all-features --token "$CARGO_REGISTRY_TOKEN"
+    - |
+      set -euo pipefail
+      TAG="${CI_COMMIT_TAG}"
+      CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 \
+        | jq -r '.packages[] | select(.name == "rmcp-server-kit") | .version')
+      if [ "$TAG" != "$CRATE_VERSION" ]; then
+        echo "ERROR: git tag $TAG does not match Cargo.toml version $CRATE_VERSION" >&2
+        exit 1
+      fi
+      if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+        echo "ERROR: CARGO_REGISTRY_TOKEN is not set as a CI/CD variable" >&2
+        exit 1
+      fi
+    - |
+      set -euo pipefail
+      TAG="${CI_COMMIT_TAG}"
+      NOTES_PATH="${CI_PROJECT_DIR}/RELEASE_NOTES.md"
+      awk -v ver="$TAG" '
+        $0 ~ "^## \\[" ver "\\]" { found=1; next }
+        found && /^## \[/        { exit }
+        found                    { print }
+      ' CHANGELOG.md > "$NOTES_PATH"
+      if [ ! -s "$NOTES_PATH" ]; then
+        echo "ERROR: No CHANGELOG.md section found for version $TAG" >&2
+        exit 1
+      fi
+      echo "----- RELEASE_NOTES.md -----"
+      cat "$NOTES_PATH"
+      echo "----- end -----"
+    - rtk cargo publish --dry-run --all-features
+    - rtk cargo publish --all-features --token "$CARGO_REGISTRY_TOKEN"
+  artifacts:
+    when: always
+    expire_in: 1 year
+    paths:
+      - RELEASE_NOTES.md
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    name: "rmcp-server-kit $CI_COMMIT_TAG"
+    description: "./RELEASE_NOTES.md"
