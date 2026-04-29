@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-04-29
+
 ### Added
 
 - **Configurable security headers** (`src/transport.rs`) -- new

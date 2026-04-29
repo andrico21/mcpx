@@ -314,7 +314,7 @@ pub struct McpServerConfig {
     /// the global response middleware. See [`SecurityHeadersConfig`]
     /// for the three-state semantic and validation rules.
     #[deprecated(
-        since = "1.4.2",
+        since = "1.5.0",
         note = "use McpServerConfig::with_security_headers(); direct field access will become pub(crate) in 1.0"
     )]
     pub security_headers: SecurityHeadersConfig,
