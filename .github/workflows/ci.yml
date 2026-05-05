@@ -243,6 +243,10 @@ jobs:
     # manual dispatch.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
+    # Hard-cap the job well below GitHub's 6h ceiling so it terminates
+    # gracefully (allowing `continue-on-error` to take effect) instead of
+    # being SIGKILLed and marking the entire workflow run as failed.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -251,7 +255,10 @@ jobs:
         run: cargo install cargo-mutants --locked
       - name: Run cargo mutants on rbac + auth + oauth
         # Scope to the security-critical modules so a single nightly run
-        # completes in a reasonable wall-clock window.
-        run: cargo mutants --no-shuffle --timeout 300 -f src/rbac.rs -f src/auth.rs -f src/oauth.rs || true
+        # completes in a reasonable wall-clock window. Wrap the whole
+        # invocation in `timeout` so we exit 0 even if cargo-mutants itself
+        # blows past the wall-clock budget (GitHub's job-level
+        # `timeout-minutes` SIGKILLs and bypasses `|| true`).
+        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 180 -j 2 -f src/rbac.rs -f src/auth.rs -f src/oauth.rs || true
 
 
