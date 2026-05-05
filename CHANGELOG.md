@@ -8,6 +8,19 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Added
+
+- **Mutation-coverage tests** for `glob_match` / `match_middle` boundary
+  cases in `src/rbac.rs` and for `RbacPolicy::argument_allowed` glob-tool
+  matching, killing five surviving mutants surfaced by the nightly
+  `cargo mutants` job. Each test is annotated with the specific mutation
+  it kills so the intent survives future refactors.
+- **Exact-string contract tests** for `AuthFailureClass::as_str`,
+  `response_body`, and `bearer_error` in `src/auth.rs`. These literals
+  are part of the observable wire/log surface (metric labels, audit-log
+  fields, OAuth `WWW-Authenticate` reasons); the tests pin them so a
+  silent change becomes a test failure.
+
 ## [1.5.0] - 2026-04-29
 
 ### Added

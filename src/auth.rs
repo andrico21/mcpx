@@ -1785,4 +1785,86 @@ mod tests {
             "redaction marker missing: {dbg}"
         );
     }
+
+    // -- AuthFailureClass exact-string contract tests --
+    //
+    // These tests pin the exact wire strings emitted for each failure
+    // class. They exist to kill mutation-test mutants that replace the
+    // match-arm string literals (e.g. with `""` or with the value from
+    // another arm). Operators and dashboards rely on these literals
+    // for metric labels and audit-log filters; any change is a
+    // breaking observability change and must be reflected in
+    // CHANGELOG.md.
+
+    #[test]
+    fn auth_failure_class_as_str_exact_strings() {
+        assert_eq!(
+            AuthFailureClass::MissingCredential.as_str(),
+            "missing_credential"
+        );
+        assert_eq!(
+            AuthFailureClass::InvalidCredential.as_str(),
+            "invalid_credential"
+        );
+        assert_eq!(
+            AuthFailureClass::ExpiredCredential.as_str(),
+            "expired_credential"
+        );
+        assert_eq!(AuthFailureClass::RateLimited.as_str(), "rate_limited");
+        assert_eq!(AuthFailureClass::PreAuthGate.as_str(), "pre_auth_gate");
+    }
+
+    #[test]
+    fn auth_failure_class_response_body_exact_strings() {
+        assert_eq!(
+            AuthFailureClass::MissingCredential.response_body(),
+            "unauthorized: missing credential"
+        );
+        assert_eq!(
+            AuthFailureClass::InvalidCredential.response_body(),
+            "unauthorized: invalid credential"
+        );
+        assert_eq!(
+            AuthFailureClass::ExpiredCredential.response_body(),
+            "unauthorized: expired credential"
+        );
+        assert_eq!(
+            AuthFailureClass::RateLimited.response_body(),
+            "rate limited"
+        );
+        assert_eq!(
+            AuthFailureClass::PreAuthGate.response_body(),
+            "rate limited (pre-auth)"
+        );
+    }
+
+    #[test]
+    fn auth_failure_class_bearer_error_exact_strings() {
+        assert_eq!(
+            AuthFailureClass::MissingCredential.bearer_error(),
+            (
+                "invalid_request",
+                "missing bearer token or mTLS client certificate"
+            )
+        );
+        assert_eq!(
+            AuthFailureClass::InvalidCredential.bearer_error(),
+            ("invalid_token", "token is invalid")
+        );
+        assert_eq!(
+            AuthFailureClass::ExpiredCredential.bearer_error(),
+            ("invalid_token", "token is expired")
+        );
+        assert_eq!(
+            AuthFailureClass::RateLimited.bearer_error(),
+            ("invalid_request", "too many failed authentication attempts")
+        );
+        assert_eq!(
+            AuthFailureClass::PreAuthGate.bearer_error(),
+            (
+                "invalid_request",
+                "too many unauthenticated requests from this source"
+            )
+        );
+    }
 }

@@ -1001,6 +1001,92 @@ mod tests {
         assert!(!glob_match("*web*prod*", "my-api-us-staging"));
     }
 
+    // -- glob_match boundary / mutation-coverage tests --
+    //
+    // The cases below exist to kill specific mutants surfaced by
+    // `cargo mutants` against `glob_match` / `match_middle` (see
+    // CI run #84, May 2026). Each test is annotated with the mutation
+    // it kills so the intent survives future refactors.
+
+    /// Kill: `if pos > end` mutated to `pos == end` and `pos >= end`
+    /// at `glob_match` line 863. The prefix and suffix exactly meet
+    /// (no characters between them); the original code accepts this,
+    /// both mutants reject it.
+    #[test]
+    fn glob_prefix_and_suffix_meet_exactly() {
+        // parts = ["ab", "cd"]; first.len()=2, end=text.len()-last.len()=2.
+        // pos == end → original passes the `pos > end` check, mutants fail.
+        assert!(glob_match("ab*cd", "abcd"));
+    }
+
+    /// Kill: `parts.len() - 1` mutated to `parts.len() + 1` at line 868
+    /// (middle-parts slice when pattern has a non-empty suffix). The
+    /// mutant collapses the middle-parts slice to empty, which would
+    /// incorrectly accept patterns whose middle segment isn't present.
+    #[test]
+    fn glob_middle_segment_required_with_suffix() {
+        // Pattern requires "b" between "a" and "c"; text omits it.
+        // Original: middle_parts=["b"], match_middle("xy", ["b"])=false → reject.
+        // Mutant `+`: middle_parts=[] (slice out of bounds → unwrap_or_default),
+        //             match_middle("xy", [])=true → wrongly accept.
+        assert!(!glob_match("a*b*c", "axyc"));
+    }
+
+    /// Kill: `idx + part.len()` mutated to `idx - part.len()` at
+    /// `match_middle` line 885. The mutant either underflows
+    /// (panic in test) or fails to advance past the matched part,
+    /// causing it to re-find the same prefix and accept patterns
+    /// that should be rejected.
+    #[test]
+    fn glob_match_middle_advances_past_matched_part() {
+        // Original: after finding "ab" at idx 2, advance to text[4..]="_yz",
+        //           which contains no second "ab" → reject.
+        // Mutant `-`: text[2-2..]="xxab_yz" → re-finds "ab" → wrongly accept
+        //             (or panics for the smaller-idx variants).
+        assert!(!glob_match("*ab*ab*", "xxab_yz"));
+    }
+
+    /// Kill: `idx + part.len()` mutated to `idx * part.len()` at
+    /// `match_middle` line 885. The mutant computes a different
+    /// (usually larger) advance offset that produces an out-of-bounds
+    /// slice and panics, or skips over content that should match.
+    #[test]
+    fn glob_match_middle_uses_addition_not_multiplication() {
+        // Original: find "abcde" at idx 8 in "yyyyyyyyabcde_X", advance
+        //           to text[13..]="_X", find "X" → accept.
+        // Mutant `*`: text[8*5..]=text[40..] → out-of-bounds → panic.
+        assert!(glob_match("*abcde*X*", "yyyyyyyyabcde_X"));
+    }
+
+    // -- RbacPolicy::argument_allowed mutation-coverage tests --
+
+    /// Kill: `&&` mutated to `||` at `argument_allowed` line 494.
+    /// The original short-circuits the allowlist lookup only when both
+    /// the literal name AND the glob fail to match. The mutant
+    /// short-circuits when EITHER fails, which means a glob-matched
+    /// allowlist (literal mismatch, glob match) is silently skipped
+    /// and the call is wrongly allowed.
+    #[test]
+    fn argument_allowed_glob_pattern_with_literal_mismatch_still_enforced() {
+        // Allowlist registered against pattern "run-*" with allowed=["ls"].
+        // Calling tool="run-foo" — literal "run-*" != "run-foo" (true),
+        // but glob_match("run-*", "run-foo") = true.
+        //   Original `&&`: skip-condition = true && false = false → enforce
+        //                  allowlist → "rm" not in ["ls"] → deny.
+        //   Mutant `||`:   skip-condition = true || false = true → skip
+        //                  allowlist → wrongly allow.
+        let role = RoleConfig::new("viewer", vec!["run-foo".into()], vec!["*".into()])
+            .with_argument_allowlists(vec![ArgumentAllowlist::new(
+                "run-*",
+                "cmd",
+                vec!["ls".into()],
+            )]);
+        let mut config = RbacConfig::with_roles(vec![role]);
+        config.enabled = true;
+        let policy = RbacPolicy::new(&config);
+        assert!(!policy.argument_allowed("viewer", "run-foo", "cmd", "rm"));
+    }
+
     // -- RbacPolicy::check tests --
 
     #[test]
