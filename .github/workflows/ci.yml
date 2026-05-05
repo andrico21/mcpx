@@ -253,12 +253,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
-      - name: Run cargo mutants on rbac + auth + oauth
-        # Scope to the security-critical modules so a single nightly run
-        # completes in a reasonable wall-clock window. Wrap the whole
-        # invocation in `timeout` so we exit 0 even if cargo-mutants itself
+      - name: Run cargo mutants on rbac + auth
+        # Scope to the two security-critical modules where mutation testing
+        # is most informative. `oauth.rs` was previously included but its
+        # ~1700 lines dominated runtime (the suite only reached ~30% of
+        # mutants before the wall-clock cap) and most of its mutants are
+        # config-builder boilerplate. Dropping it lets the nightly run
+        # actually complete and produce an actionable MISSED report.
+        # Wrap in `timeout` so we exit 0 even if cargo-mutants itself
         # blows past the wall-clock budget (GitHub's job-level
         # `timeout-minutes` SIGKILLs and bypasses `|| true`).
-        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 180 -j 2 -f src/rbac.rs -f src/auth.rs -f src/oauth.rs || true
+        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 180 -j 2 -f src/rbac.rs -f src/auth.rs || true
 
 
