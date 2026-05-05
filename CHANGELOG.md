@@ -20,6 +20,10 @@ Breaking changes bump the **major** version.
   are part of the observable wire/log surface (metric labels, audit-log
   fields, OAuth `WWW-Authenticate` reasons); the tests pin them so a
   silent change becomes a test failure.
+- **Boolean-flag contract tests** for `AuthConfig::summary` in
+  `src/auth.rs`, asserting `bearer` is `true` iff `api_keys` is
+  non-empty (kills the surviving `!`-deletion mutant at line 615) and
+  pinning `enabled` / `mtls` / `oauth` propagation.
 
 ## [1.5.0] - 2026-04-29
 

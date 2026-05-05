@@ -1867,4 +1867,40 @@ mod tests {
             )
         );
     }
+
+    // -- AuthConfig::summary boolean-flag contract tests --
+    //
+    // These tests pin the boolean flags emitted by `AuthConfig::summary`
+    // so that mutations like deleting `!` (which would invert the
+    // semantics of `bearer`) or replacing `is_some()` with `is_none()`
+    // are caught immediately. The summary is consumed by `/admin/*`
+    // diagnostics so any inversion is an operator-visible regression.
+
+    #[test]
+    fn auth_config_summary_bearer_true_when_keys_present() {
+        let (_token, hash) = generate_api_key().unwrap();
+        let cfg = AuthConfig::with_keys(vec![ApiKeyEntry::new("k", hash, "viewer")]);
+        let s = cfg.summary();
+        assert!(s.enabled, "summary.enabled must reflect AuthConfig.enabled");
+        assert!(
+            s.bearer,
+            "summary.bearer must be true when api_keys is non-empty (kills `!` deletion at L615)"
+        );
+        assert!(!s.mtls, "summary.mtls must be false when mtls is None");
+        assert!(!s.oauth, "summary.oauth must be false when oauth is None");
+        assert_eq!(s.api_keys.len(), 1);
+        assert_eq!(s.api_keys[0].name, "k");
+        assert_eq!(s.api_keys[0].role, "viewer");
+    }
+
+    #[test]
+    fn auth_config_summary_bearer_false_when_no_keys() {
+        let cfg = AuthConfig::with_keys(vec![]);
+        let s = cfg.summary();
+        assert!(
+            !s.bearer,
+            "summary.bearer must be false when api_keys is empty (kills `!` deletion at L615)"
+        );
+        assert!(s.api_keys.is_empty());
+    }
 }
